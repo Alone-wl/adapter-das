@@ -26,7 +26,8 @@
 这是环境物料准备完成，尚未在该镜像上完成本分支的 GLM 模型启动与精度验证。
 镜像名含 vllm 不表示本次切换推理框架；本次代码仍为 SGLang 适配。
 
-Plugin 提供 `examples/glm5.3-flash/launch.sh`、`adapter-config.json`、`deepep.json`。
+Plugin 提供 `examples/glm5.3-flash/launch.sh`、`router.sh`、`adapter-config.json`、`deepep.json`，
+以及源码校验器 `verify_upstream.py` 和无插桩源码指纹 `upstream-source.json`。
 脚本从远端最后候选启动参数整理：P=TP8/CP8/EP8、INT8、normal DeepEP；
 D=两节点 TP16/DP16/EP16、INT4、low_latency DeepEP；EAGLE 5 steps/6 draft tokens。
 节点编号 22/23/24 是脚本角色选择值，IP 由变量提供；21 不在该 P/D 拓扑内。
@@ -35,9 +36,17 @@ D=两节点 TP16/DP16/EP16、INT4、low_latency DeepEP；EAGLE 5 steps/6 draft t
 容器内使用对应 Python 3.12 解释器，按 cookbook 安装匹配的官方 SGLang 源码与依赖；
 再用 `python3 -m pip install --no-deps -e "$PLUGIN_DIR"` 注册 plugin entry point。
 显式设置 `ADAPTER_DIR`、`SGLANG_DIR`、`PLUGIN_DIR`，避免旧 `/work/site` 包混入。
-上游源码必须支持本候选所引用的 HookRegistry/GLM5/DSA 接口；仅 `sglang==0.5.22`
-版本号不能证明兼容，原实验上游路径为 `sources/paired-layer-boundary-20261103-v2/migration`，
-仍需核实并固定其来源 commit/patch 清单，不能直接换成任意最新上游。
+历史记录固定的官方 SGLang commit 为 `baa9befa381511cd4d56f83980951e5a45fffc6d`，
+来源为 cp-pd-source-manifest 与原安装文档。远端 `sources/official` 是无 `.git` 的导出树，
+本次不能重新由它证明 commit 身份，故同时交付实际官方 Python 包的逐文件 SHA256，启动必须匹配。
+`SGLANG_DIR` 可指向含 `python/sglang` 的源码树，或含 `sglang` 的包目录。
+新启动脚本先校验源码，再设置精确 PYTHONPATH，不继承旧 observer/site 路径。
+
+实验树 `sources/paired-layer-boundary-20261103-v2/migration/sglang` 对比保存的
+`official/python/sglang`，只有 `srt/model_executor/model_runner.py` 不同：文件末尾新增
+`_install_glm53_boundary_observer()`，无条件 import `glm53_paired_observer.install_runner` 并安装。
+因此只 unset observer 环境不足以去除导入依赖。部署使用保存的无插桩官方树；校验器会拒绝该诊断树，
+无需给产品提供 observer stub，也不修改在服官方文件。哈希检查覆盖包文件，不认证外部依赖、C++ 构建产物或镜像。
 
 ```bash
 export PLUGIN_DIR=/path/to/sglang-plugin-das
@@ -53,14 +62,26 @@ bash "$PLUGIN_DIR/examples/glm5.3-flash/launch.sh"
 
 D 两节点分别设 `GLM53_NODE=23/24` 与本机 `HOST_IP`，其余配对变量保持一致。
 模型子目录分别为 `GLM-5.3-Flash-W8A8-INT8` 和 `GLM-5.3-Flash-W4A8-INT4`。
-NIC 默认 bond1/shca_0..3，须按节点真实设备核对。router/客户端仍沿 cookbook 单独启动。
+NIC 默认 bond1/shca_0..3，须按节点真实设备核对。模型服务就绪后单独启动 router：
+
+```bash
+export ROUTER_HOST=<router-ip>
+export PREFILL_URL=http://<prefill-ip>:30822
+export DECODE_URL=http://<decode-rank0-ip>:30822
+bash "$PLUGIN_DIR/examples/glm5.3-flash/router.sh"
+```
+
+router 使用 round_robin、请求超时 7500 秒、禁用自动重试；默认服务/metrics/bootstrap 端口
+为 30881/29081/30998。`sglang_router` 须在对应解释器环境可导入；未在本次启动或重装 router。
+客户端按原评测 manifest 配置，不能将 router 的超时设置当作生成 token 上限。
 脚本中的 1M context、32K chunk、HiCache/Graph 参数继承实验配置，不表示已在新镜像验收。
 脚本通过 bash 语法检查；没有在本次整理期间启动模型。
 
 必要数值开关：两角色 `SGLANG_USE_FUSED_SILU_MUL_QUANT=1`；D 的
 `W8A8_SUPPORT_METHODS=3`；`SGLANG_HCU_NATIVE_MHC=1`；LightOp MLA gather 开启。
 `HCU_CONFIG` 选择 DTK sparse MLA、LightOp INT8 MM、Triton grouped topk。
-网页 `tools/hcu_config_ui.html` 主要管理 adapter 配置，不能据此声称可生成完整 P/D 启动脚本；
+网页 `tools/hcu_config_ui.html` 已能生成旧 cookbook 的通用启动命令及 P/D/router 三段命令，
+但尚未接入本次 GLM-5.3 plugin+adapter 配方，不能用它替代本次脚本；
 plugin `architecture.html` 是文档导览。本次以仓内 `.sh` 为启动交接入口。
 
 ## 已完成的代码与证据边界
@@ -71,7 +92,7 @@ plugin `architecture.html` 是文档导览。本次以仓内 `.sh` 为启动交�
 | KDA beta | raw beta 在 FP32 做 sigmoid，避免转回低精度 | 已同步；与前述状态快照是两项不同修正 |
 | FFN 量化及截断 | plugin GLM MLP → row_fusion → LightOp，传 swiglu_limit；W8A8/SlimQuant 接收预量化输入 | 不只加启动开关；需要模型 forward 和量化接口共同接通 |
 | 两次 DeepGEMM 中间激活 | INT8 runner 保留 SiLU、clamp、量化顺序及相应分支 | normal/masked、INT4/INT8、空批次须分别核实，不能跨分支外推 |
-| 短序列 KPool | 原生有序 arange 替代零 logits 的 topk 顺序；保留 PAGED/RAGGED、逻辑索引及 tail padding | 修复后同前缀复测、无插桩 badcase 仍待完成 |
+| 短序列 KPool | 原生有序 arange 替代零 logits 的 topk 顺序；保留 PAGED/RAGGED、逻辑索引及 tail padding | 远端同前缀重复性 24/24 通过；九题 6/9，复读未解决 |
 | MLA / HiCache / LayerSplit / MTP | 含 native MLA、按页广播、非 owner scratch、draft host 层映射、speculative 兼容 | 历史定向探针已记录；本次整合快照未做新的 GPU 验收 |
 
 短索引根因证据：三题、每题两次、八个 prefill rank，共 24 对；第 0～2 层完整边界及
@@ -81,7 +102,13 @@ plugin `architecture.html` 是文档导览。本次以仓内 `.sh` 为启动交�
 
 ## 未完成与已知问题
 
-1. **当前精度与复读未闭环（最高优先级）**：短索引修复后的三题同前缀配对、九题无插桩回归尚缺完整报告。
+1. **当前精度与复读未闭环（最高优先级）**：修复后三题 2/85/131，每题两次、八个 P rank，24/24 配对通过。
+   这是 P 重复性验证：45 层抽样六边界、0/1/2/3/44 层完整边界、第3层 MLA、末端 logits 全部通过；
+   不是所有层所有元素的原生/迁移等价，也不覆盖 D verify 状态。
+   最新九题 6/9（66.7%），错 7/90/127；102 由错转对，第7题由对转错，总分持平。
+   全部 stop、无请求错误/重试/截断，max_tokens=65536。127 连续50词窗口最多出现3次，其他八题未检出该类长段完全重复，
+   不等于没有语义重述。逐题答案、参考、响应哈希与计数见 `glm5.3-flash-results-20261104.json`。
+   **上述结果仅归属远端 P/D 分别使用的快照**，不是统一提交组合或 Python3.12 新镜像验收。
    历史 P-only 融合候选九题 7/9，P+D 融合候选 6/9（错 90/102/127），均正常 stop，仍有重复片段。
    这是筛选坏例、非固定种子的单次结果，不是 GPQA 总体准确率或因果 A/B。
 2. **历史全集不可继承**：较早冻结配置 HE 97.56%、MATH500 95.40%、GPQA 90.40%、HMMT 80.00%；
@@ -101,7 +128,7 @@ plugin `architecture.html` 是文档导览。本次以仓内 `.sh` 为启动交�
 ## 接手顺序与证据位置
 
 先固定两仓提交、官方源码、镜像和核心库哈希，检查进程实际 import 来源；再按 prefill/decode/verify
-做逐分支清单、三题同 token 前缀对比、九题并发 9 的无插桩坏例及复读检查；通过后跑全集与同配置 profile/性能。
+做逐分支清单。已有远端 24/24 与九题 6/9 可作诊断依据；统一提交组合/新镜像须单独复测，继续定位余下错题与复读，之后跑全集与同配置 profile/性能。
 任何失败保留原请求、响应、token 上限与 finish_reason，不将重复推理仅按最终答案正确忽略。
 
 原始远端任务根目录由维护者提供为 `GLM53_TASK_ROOT`，不要依赖临时 `/tmp` 脚本。
@@ -109,7 +136,8 @@ plugin `architecture.html` 是文档导览。本次以仓内 `.sh` 为启动交�
 
 - `logs/mla-internal-repeat-20261104-v2-complete.tar.gz`，SHA256 `6d37c690b24f71e4016b7caa2cafef278afbd2c2e128d119ea18e330257fbb0b`。
 - `logs/ffn-lightop-pd-gpqa-badcase-20261103-v1`：P+D 九题原始输出与 review。
-- `logs/short-topk-aligned-repeat-20261104-v2`：本次只读检查时 client.log 仍记 waiting warmup、cases_sent=0，不能认定修复后验收通过。
+- `logs/short-topk-aligned-repeat-20261104-v2/alignment-verification.json`：最新 24/24 passed。先前 client.log 的 waiting/cases_sent=0 已被后续结果取代。
+- `logs/short-topk-aligned-gpqa-badcase-20261104-v1`：九题全部结束，status 的 pending_review 字样不代表生成未完成；本次重新读取 response 并核对参考为 6/9。
 - `scripts/short-topk-aligned-repeat-20261104-v2`：历史启动与诊断脚本。
 - 两仓 `docs/glm5.3-flash-source.json`：已同步源码的来源与 SHA256；配套历史细节见 plugin 的 `docs/hcu-sglang-development.md`。
 
@@ -119,3 +147,10 @@ plugin `architecture.html` 是文档导览。本次以仓内 `.sh` 为启动交�
 两仓执行 `git diff --check` 与暂存差异检查。Python AST 语法检查包含在 L0 中，启动脚本运行 `bash -n`。
 这些是静态交付验证，不代表新镜像上的模型精度、性能或页面浏览器渲染验收。
 仓库当前未绑定 GitHub Actions 的自动检查不能写成“GitHub CI 已通过”。
+
+## 更新范围与仍待执行的验收
+
+本次只更新交接、证据、启动保护及 router 配方，没有改变两仓运行时代码、重启远端服务或运行 GPU 评测。
+**adapter 网页配置按用户要求暂不接入**；旧网页生成器不能代替这套脚本。
+原代码提交 plugin `8dac29c` / adapter `90a2c91` 的来源哈希契约保持不变。
+脚本完整性与模型验收分开：尚待统一提交组合的 import/启动、Python3.12 核心库一致性、全路径数值和最终精度/性能复测。
