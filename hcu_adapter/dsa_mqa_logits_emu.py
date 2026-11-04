@@ -77,6 +77,56 @@ def fp8_paged_mqa_logits(
             print("[HCU mqain] err", e, flush=True)
     if max_context_len is None:
         max_context_len = int(block_table.shape[1]) * 64
+    if kv_cache_fp8.dim() == 2:
+        kv_cache_fp8 = kv_cache_fp8.reshape(-1, 64, 1, kv_cache_fp8.shape[-1])
+    if weights.dim() == 3:
+        weights = weights.reshape(weights.shape[0], -1)
+    # impl selection (registry-gated): "vec" collapses the tile loop into a
+    # single full-window pass for decode-shaped rows. The double loop below
+    # tiles (64, 2048); the CAPTURED decode graph runs it with the full
+    # max-context window (e.g. 64K -> 32 inner iterations x ~12 aten ops x
+    # 45 layers ~= 17k of the ~24k graph nodes = the submission bottleneck).
+    # Large-N (prefill) keeps the loop: full-window gather there would need
+    # N*T*128*2B transient memory (8K tokens x 64K window = impossible).
+    impl = "loop"
+    try:
+        from .hcu_env import resolve
+
+        impl, _src = resolve("HCU_MQA_LOGITS_IMPL")
+    except Exception:
+        pass
+    if impl == "vendor":
+        # R-02: DTK deepgemm wheel native path, A/B tier (parity gate
+        # tests/kernels/test_mqa_vendor_gfx938.py; layout unvalidated).
+        from .mqa_vendor import deepgemm_paged_mqa_logits as _dg
+
+        return _dg(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_table,
+            schedule_metadata=schedule_metadata,
+            max_context_len=max_context_len,
+            clean_logits=clean_logits,
+        )
+    if impl == "triton":
+        # R-02 homegrown tier: reads the REAL SetKAndS pool layout (16-tile
+        # interleave + tail scales) that this emu's flat (T,132) unpack
+        # misreads — correctness fix + single-launch decode graph. Parity
+        # gate tests/kernels/test_mqa_triton_gfx938.py.
+        from .mqa_logits_triton import triton_paged_mqa_logits as _tri
+
+        return _tri(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_table,
+            schedule_metadata=schedule_metadata,
+            max_context_len=max_context_len,
+            clean_logits=clean_logits,
+        )
     N = q_fp8.shape[0] if q_fp8.dim() == 3 else q_fp8.shape[0] * q_fp8.shape[1]
     if q_fp8.dim() == 4:
         q_flat = q_fp8.reshape(-1, q_fp8.shape[-2], q_fp8.shape[-1])
@@ -90,8 +140,6 @@ def fp8_paged_mqa_logits(
         q_b = _as_view(q_fp8, _fp8_view_dtype()).to(torch.bfloat16).contiguous()
         N, H, D = q_b.shape
 
-    if kv_cache_fp8.dim() == 2:
-        kv_cache_fp8 = kv_cache_fp8.reshape(-1, 64, 1, kv_cache_fp8.shape[-1])
     PS = kv_cache_fp8.shape[1] if kv_cache_fp8.dim() == 4 else 1
     # Pool layout (2026-10-18 R-02 audit, final): every page is k in the
     # 16-tile INTERLEAVE order + PS fp32 scales at the tail — written by
@@ -146,60 +194,12 @@ def fp8_paged_mqa_logits(
         k_b = kb16.to(torch.bfloat16).reshape(-1, kb16.shape[-1])
         k_sf = torch.ones(k_b.shape[0], device=kb16.device)
 
-    if weights.dim() == 3:
-        weights = weights.reshape(weights.shape[0], -1)
     w = weights.reshape(q_b.shape[0], H).to(torch.float32)
     ctx = context_lens.to(torch.int64).reshape(-1)
     bt = block_table.to(torch.int64).contiguous()
 
     device = q_b.device
 
-    # impl selection (registry-gated): "vec" collapses the tile loop into a
-    # single full-window pass for decode-shaped rows. The double loop below
-    # tiles (64, 2048); the CAPTURED decode graph runs it with the full
-    # max-context window (e.g. 64K -> 32 inner iterations x ~12 aten ops x
-    # 45 layers ~= 17k of the ~24k graph nodes = the submission bottleneck).
-    # Large-N (prefill) keeps the loop: full-window gather there would need
-    # N*T*128*2B transient memory (8K tokens x 64K window = impossible).
-    impl = "loop"
-    try:
-        from .hcu_env import resolve
-
-        impl, _src = resolve("HCU_MQA_LOGITS_IMPL")
-    except Exception:
-        pass
-    if impl == "vendor":
-        # R-02: DTK deepgemm wheel native path, A/B tier (parity gate
-        # tests/kernels/test_mqa_vendor_gfx938.py; layout unvalidated).
-        from .mqa_vendor import deepgemm_paged_mqa_logits as _dg
-
-        return _dg(
-            q_fp8,
-            kv_cache_fp8,
-            weights,
-            context_lens,
-            block_table,
-            schedule_metadata=schedule_metadata,
-            max_context_len=max_context_len,
-            clean_logits=clean_logits,
-        )
-    if impl == "triton":
-        # R-02 homegrown tier: reads the REAL SetKAndS pool layout (16-tile
-        # interleave + tail scales) that this emu's flat (T,132) unpack
-        # misreads — correctness fix + single-launch decode graph. Parity
-        # gate tests/kernels/test_mqa_triton_gfx938.py.
-        from .mqa_logits_triton import triton_paged_mqa_logits as _tri
-
-        return _tri(
-            q_fp8,
-            kv_cache_fp8,
-            weights,
-            context_lens,
-            block_table,
-            schedule_metadata=schedule_metadata,
-            max_context_len=max_context_len,
-            clean_logits=clean_logits,
-        )
     vec_max = int(os.environ.get("HCU_MQA_VEC_MAXROWS", "32"))
     if impl == "vec" and N <= vec_max:
         T_all = min(int(max_context_len), bt.shape[1] * PS)
@@ -216,7 +216,7 @@ def fp8_paged_mqa_logits(
         # product hits the DTK elementwise cliff (~0.8 GB/s) and made the
         # naive vec form 3.5x slower than loop in serving.
         sT = torch.matmul(kg, q_b.transpose(1, 2))  # (N, T, H) bf16
-        row = torch.matmul(sT, w.unsqueeze(2).to(torch.bfloat16)).squeeze(2)  # (N, T)
+        row = torch.matmul(sT.relu(), w.unsqueeze(2).to(torch.bfloat16)).squeeze(2)  # (N, T)
         row = row.float() * sc
         valid = torch.arange(T_all, device=device).unsqueeze(0) < ctx.unsqueeze(1)
         if T_all >= int(max_context_len):
@@ -244,7 +244,7 @@ def fp8_paged_mqa_logits(
             kg = k_b[toks]  # (Q, T, D)
             sc = k_sf[toks]  # (Q, T)
             s = torch.matmul(qb, kg.transpose(1, 2)).float()  # (Q, H, T)
-            row = (s * w[i0:i1].unsqueeze(-1)).sum(dim=1) * sc  # (Q, T)
+            row = (s.relu() * w[i0:i1].unsqueeze(-1)).sum(dim=1) * sc  # (Q, T)
             valid = ar[: t1 - t0].unsqueeze(0) + t0 < seq_rows.unsqueeze(1)
             logits[i0:i1, t0:t1] = torch.where(valid, row, 0.0)
     return logits

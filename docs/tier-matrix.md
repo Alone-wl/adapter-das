@@ -1,8 +1,61 @@
 # 算子档位矩阵（自动生成，勿手改）
 
-> 生成：`python tools/gen_tier_matrix.py`（最近 2026-10-29）；事实源 = `BACKEND_CATALOG`（hcu_adapter/hcu_config.py）。
+> 生成：`python tools/gen_tier_matrix.py`（最近 2026-11-01）；事实源 = `BACKEND_CATALOG`（hcu_adapter/hcu_config.py）。
 > L0 `impl-naming` 做新鲜度校验改表须随 catalog 同 commit（governance §3b）。
 > 文件命名导航规则见 governance §3b；缺档 = 该行空白——那是实现排期的直接输入。
+
+## sglang_grouped_topk
+
+SGLang biased single-group MoE routing
+
+| 档位 | 状态 / 备注 |
+|---|---|
+| triton | candidate Opt-in upstream fused router for FP3 |
+| torch | validated Default current upstream dispatch |
+
+路由变量：（auto）
+
+## int8_scaled_mm
+
+SGLang symmetric per-token/per-channel INT8 dense GEMM
+
+| 档位 | 状态 / 备注 |
+|---|---|
+| triton | validated Default stride-aware INT32 accumulat |
+| lightop | candidate Opt-in BF16 prefill M>=32, K multipl |
+
+路由变量：（auto）
+
+## hicache_mla_transfer
+
+MLA HiCache byte transfers through device pointer tables and pinned host memory
+
+| 档位 | 状态 / 备注 |
+|---|---|
+| triton | candidate Layer-first and page-first MLA trans |
+
+路由变量：（auto）
+
+## sglang_mla_sparse
+
+SGLang BF16 NoPE sparse MLA interface
+
+| 档位 | 状态 / 备注 |
+|---|---|
+| emu | candidate Default Torch compatibility implemen |
+| dtk | candidate Opt-in H1-64 D512 topk2048-2112 nati |
+
+路由变量：（auto）
+
+## sglang_mla_fp8
+
+SGLang V32_NO_ROPE packed E4M3 sparse MLA decode
+
+| 档位 | 状态 / 备注 |
+|---|---|
+| emu | candidate SGLang-only 528-byte rows; FP32 atte |
+
+路由变量：（auto）
 
 ## silu_and_mul
 
@@ -69,8 +122,8 @@ DSA paged MQA logits
 
 | 档位 | 状态 / 备注 |
 |---|---|
-| triton | production homegrown triton kernel (mqa_logits_ |
-| emu | production torch emulation — correct opt-out (H |
+| triton | candidate 2026-11-01: ragged prefill N>=32,D=1 |
+| emu | candidate 2026-10-30: restored upstream per-he |
 | aiter | planned probed absent 2026-10-18: the on-box |
 | lightop | planned lightop.attention.paged_mqa_logits;  |
 | deepgemm | broken deepgemm wheel direct call via mqa_v |
@@ -174,6 +227,16 @@ fa3 backend 注意力面（kvcache 分页/统一窗 + varlen prefill）
 | vendor | candidate DTK flash_attn 2.8.4 wheel（gfx93x ke |
 
 路由变量：`HCU_FA_IMPL`
+
+## sglang_tree_sampling
+
+SGLang target-only speculative tree sampling
+
+| 档位 | 状态 / 备注 |
+|---|---|
+| triton | candidate Tree traversal, residual mass and CD |
+
+路由变量：（auto）
 
 ## sampling
 

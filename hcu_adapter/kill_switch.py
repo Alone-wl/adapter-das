@@ -30,6 +30,9 @@ LOG = logging.getLogger("hcu.adapter")
 
 # canonical name -> (what gets blocked, opt-in env that re-enables it)
 SWITCHES = {
+    "sglang_tree_sampling": ("SGLang target-only stochastic tree sampling; disabled calls fail explicitly", None),
+    "sglang_grouped_topk": ("SGLang grouped router; ops.sglang_grouped_topk=torch restores current dispatch", None),
+    "int8_scaled_mm": ("SGLang INT8 dense GEMM provider; ops.int8_scaled_mm=triton restores reference route", None),
     "deep_ep": ("DeepInfer DeepEP compatibility surface", None),
     "worker.runtime": ("DeepInfer worker lifecycle adaptation", None),
     "deep_gemm": ("DeepInfer GEMM/MQA/mHC compatibility surface", None),

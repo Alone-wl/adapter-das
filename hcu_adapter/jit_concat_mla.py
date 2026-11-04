@@ -125,8 +125,9 @@ def install():
         registered.extend([_DLDEVICE_NEEDLE] * n_dev)
     from hcu_adapter.atomic_io import atomic_write
 
-    atomic_write(p, text)
     applied = len(registered)
+    if applied:
+        atomic_write(p, text)
 
     import hcu_adapter.registry as _reg
 

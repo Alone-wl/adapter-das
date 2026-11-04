@@ -17,6 +17,8 @@ becomes the AOT backend on HCU.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
 from .compat import HAS_TRITON, check_cuda_tensor
@@ -67,6 +69,19 @@ if HAS_TRITON:
                  mask=m_mask[:, None] & n_mask[None, :])
 
 
+@lru_cache(maxsize=1)
+def _backend():
+    from hcu_adapter import registry
+    from hcu_adapter.ops.selector import select
+
+    backend = select("int8_scaled_mm", "triton")
+    registry.register(
+        "int8_scaled_mm", backend, "sgl_kernel.gemm_int8.int8_scaled_mm",
+        registry.MECH_SEAM,
+    )
+    return backend
+
+
 def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     """C = (A @ B) * sa[:,None] * sb[:,None or 1,N] + bias, int32 accumulate."""
     if not (HAS_TRITON and mat_a.is_cuda):
@@ -79,13 +94,20 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
 
     M, K = mat_a.shape
     N = mat_b.shape[1]
-    out = torch.empty((M, N), device=mat_a.device, dtype=out_dtype)
     if M == 0 or N == 0:
-        return out
+        return torch.empty((M, N), device=mat_a.device, dtype=out_dtype)
 
     sa = scales_a.reshape(M) if scales_a.numel() == M else scales_a.reshape(1, -1).reshape(-1)[:1].expand(M)
     sa = sa.contiguous().float()
     sb = scales_b.reshape(N).contiguous().float()
+
+    if _backend() == "lightop":
+        from hcu_adapter.kernels.sglang_int8_mm_lightop import try_scaled_mm
+
+        native = try_scaled_mm(mat_a, mat_b, sa, sb, out_dtype, bias)
+        if native is not None:
+            return native
+    out = torch.empty((M, N), device=mat_a.device, dtype=out_dtype)
 
     def _grid(meta):
         return (triton.cdiv(M, meta["BLOCK_M"]),

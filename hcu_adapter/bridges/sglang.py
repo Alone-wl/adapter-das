@@ -76,6 +76,9 @@ def install() -> None:
             from hcu_adapter import platform_seam
 
             platform_seam.install()
+            from hcu_adapter.bridges._sglang import device_visibility
+
+            device_visibility.install()
         except Exception:
             logging.getLogger("hcu.adapter").warning(
                 "HCU adapter: platform semantics seam not installed", exc_info=True
@@ -121,6 +124,14 @@ def install() -> None:
         except Exception:
             logging.getLogger("hcu.adapter").warning(
                 "HCU adapter: jit rope portability patch not installed", exc_info=True
+            )
+        try:
+            from hcu_adapter.bridges._sglang import jit_eh_norm
+
+            jit_eh_norm.install()
+        except Exception:
+            logging.getLogger("hcu.adapter").warning(
+                "HCU adapter: JIT EH norm launch bounds not installed", exc_info=True
             )
         # JIT DSA indexer k-cache store (GLM-5.2-DSA unfused path): HIP fp8x2
         # alias has no brace ctor + two HIP-vector binding decomposes.
@@ -789,14 +800,28 @@ def install() -> None:
         try:
             import sglang.srt.layers.quantization.compressed_tensors.schemes.\
                 compressed_tensors_w8a8_int8 as _cti8
+            import sglang.srt.layers.quantization.w8a8_int8 as _w8i8
 
             from sgl_kernel import int8_scaled_mm as _sk_i8mm
 
-            if getattr(_cti8, "int8_scaled_mm", None) is not _sk_i8mm:
-                _cti8.int8_scaled_mm = _sk_i8mm
+            for _int8_module in (_cti8, _w8i8):
+                if getattr(_int8_module, "int8_scaled_mm", None) is not _sk_i8mm:
+                    _int8_module.int8_scaled_mm = _sk_i8mm
+            from hcu_adapter.bridges._sglang import w8a8_int8 as _hcu_w8i8
+
+            _hcu_w8i8.install()
         except Exception:
             logging.getLogger("hcu.adapter").warning(
                 "HCU adapter: int8_scaled_mm bridge not installed", exc_info=True
+            )
+
+        try:
+            from hcu_adapter.bridges._sglang import mla_kv
+
+            mla_kv.install()
+        except Exception:
+            logging.getLogger("hcu.adapter").warning(
+                "HCU adapter: packed MLA KV writer bridge not installed", exc_info=True
             )
 
         # FlashMLA decode backend: FlashMLABackend subclasses
@@ -1204,11 +1229,15 @@ def install() -> None:
         # preshuffle path (page_size=64*index_kpool, 16-aligned cache tiles).
         try:
             import sglang.srt.layers.attention.dsa.utils as _dsa_utils
+            from sglang.srt.utils import common as _dsa_common
+
+            _dsa_utils.is_hip = _dsa_common.is_hip
+            _dsa_utils.is_cuda = _dsa_common.is_cuda
 
             _hcu_orig_gate = _dsa_utils.aiter_can_use_preshuffle_paged_mqa
             if os.environ.get("HCU_DSA_PRESHUFFLE") == "0":
                 # Legacy page_size=1 / KVBlockSize=1 DSA path (paired with the
-                # HCU_MQA_EMU torch emulation on gfx936-class DCUs).
+                # HCU_MQA_EMU torch emulation on gfx936-class HCUs).
                 def _hcu_gate():
                     return False
 
@@ -1671,7 +1700,7 @@ def install() -> None:
         # rule below is the sole AR gate now.
 
         # AiterCustomAllreduce silently corrupts data when the CUDA graph it was
-        # captured into replays on gfx936-class DCUs (eager all-reduce is fine).
+        # captured into replays on gfx936-class HCUs (eager all-reduce is fine).
         # sglang selects it as the AMD default because the C++ sgl_kernel
         # allreduce extension has no HIP build; the symptom is decode tokens
         # diverging from the first graph-replayed step while eager decode and
@@ -1723,7 +1752,7 @@ def install() -> None:
                     "HCU adapter: aiter AR gate not installed", exc_info=True
                 )
 
-        # gfx936-class DCUs have no fp8 matrix unit and the DTK aiter MQA-logits
+        # gfx936-class HCUs have no fp8 matrix unit and the DTK aiter MQA-logits
         # kernels hard-gate on gfx942/950: emulate paged/ragged fp8 MQA logits in
         # torch (dequant -> bf16 GEMM, fp32 scales). Legacy page_size=1 only.
         # hcu_env auto-rule: emulation ON only where the arch lacks fp8;
@@ -1941,7 +1970,7 @@ def install() -> None:
                 if "use_fp8" not in _ll_params and "quant_type" in _ll_params:
                     import sys as _sys
 
-                    def _ll_dispatch_v0521(
+                    def _ll_dispatch_upstream(
                         self,
                         x,
                         topk_idx,
@@ -2016,6 +2045,17 @@ def install() -> None:
                             return_recv_hook=return_recv_hook,
                             **({"x_scales": x_scales} if x_scales is not None else {}),
                         )
+
+                    def _ll_dispatch_v0521(self, x, topk_idx, *args, **kwargs):
+                        if "quant_type" in kwargs or "topk_weight" in kwargs or (
+                            args and isinstance(args[0], torch.Tensor)
+                        ):
+                            return _ll_orig(self, x, topk_idx, *args, **kwargs)
+                        if kwargs.get("topk_weights") is None:
+                            kwargs["topk_weights"] = _sys._getframe(1).f_locals.get(
+                                "topk_weights"
+                            )
+                        return _ll_dispatch_upstream(self, x, topk_idx, *args, **kwargs)
 
                     _dep.Buffer.low_latency_dispatch = _ll_dispatch_v0521
                     logging.getLogger("hcu.adapter").info(
@@ -3141,3 +3181,8 @@ def install() -> None:
                     "HCU adapter: spec-loc safe routing not installed",
                     exc_info=True,
                 )
+
+        from hcu_adapter.bridges._sglang import grouped_topk, sampling
+
+        grouped_topk.install()
+        sampling.install()

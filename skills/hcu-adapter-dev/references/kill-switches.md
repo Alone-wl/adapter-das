@@ -61,3 +61,5 @@ export HCU_DISABLE_OPS=aiter_ar,aiter_fa # 多个（逗号/空格/分号分隔�
 | `HCU_DUMP_MQA=1` | MQA emu 调用与范数日志 |
 
 注意：graph 模式下 python hook 不触发，dump 只在 eager/截层验证时用。
+
+`HCU_DISABLE_OPS=sglang_tree_sampling` 拒绝 target-only 随机树采样调用；该路径没有可用的 FlashInfer 回退，不静默改为贪心。

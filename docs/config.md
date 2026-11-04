@@ -91,3 +91,11 @@ ops:
 CLI 向导（`tools/hcu_config_wizard.py`）是其命令行形态；`--autotune` 变体=目标机自动探测+实测选档（平台画像→逐算子三门→阶梯降档带理由，见 [autotune.md](autotune.md)）。注意 UI 内嵌的
 目录/配方是代码快照，BACKEND_CATALOG 或 cookbook 变更后需同步（纯函数段
 在文件内 `/*==PURE-BEGIN*/ ... /*==PURE-END*/` 标记之间）。
+
+## SGLang sparse MLA 候选后端
+
+`ops.sglang_mla_sparse: dtk` 显式选择 SGLang 专属 BF16 sparse FlashMLA 实现；默认 `emu`，没有新增环境变量。当前原生范围为 BF16、H1–64、D512、top-k 2048–2112（掩码补齐到 64 的倍数）、无 attention sink，其他形状保留兼容路径。实现独立于 vLLM/DeepInfer。候选仅完成小规模数值和变输入 Graph 探针，整模型与性能验收尚未完成。
+
+### MLA HiCache 地址表传输
+
+`hicache_mla_transfer` 当前使用 candidate Triton 实现：按字节处理 device pointer table、pinned host buffer、layer-first/page-first 布局，不将地址值当作缓存数据索引。GPU 路径不读取地址表到 CPU。2026-11-01 定向诊断覆盖 528/8448/33792/65537 字节行、1/7/65 行、三层、双向拷贝与三次变输入 Graph 回放，逐字节一致；完整模型的驱逐回载与性能仍待验收。

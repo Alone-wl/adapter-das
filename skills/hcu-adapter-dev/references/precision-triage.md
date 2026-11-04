@@ -50,3 +50,21 @@
   形状、非连续状态视图）但 serving 中 Berlin 锚点确定性翻转；emu/fork
   启动二分 + 干净重启复现可实锤"内核在服务上下文特有"。任何内核替换默认
   不启用，e2e 锚点门过了才转默认。
+
+
+## KDA raw beta 的激活 dtype（2026-11-03）
+
+`beta_is_raw=True` 的调用方可能传入 BF16 beta，但 fork `chunk_kda` 的
+激活后 beta 应保留 FP32：使用 `beta.float().sigmoid()`，不要再回转输入
+的 dtype。`beta_is_raw=False` 时继续原样传递已经激活的 beta。
+
+GLM 固定前缀真实服务对照中，layer 0 首个有效 token 的原始投影、归一化
+Q/K、V、累计 gate 一致，首次可比数值分歧出现在激活后的 beta。3 组前缀
+× 8 个 head 分片中，迁移版 BF16 beta 均逐位等于原生 FP32 beta 的 BF16
+舍入结果，最大绝对差约 0.001885；这些前缀共享首 token，不能视作独立
+题目统计。它证明了 dtype 契约损失，不代表已解释整套评测的分数差。
+修复后仍需同前缀逐层/状态对照及原参数评测，不用短样本或 lint 代替精度验收。
+
+定位钩子必须跟随实际 dispatch：vendor GLM/HCU 使用 `HcuKDAKernel` 和
+`fla.hcu.kda`，不能只检查通用 `TritonKDAKernel`。CP 下还要排除 padding、
+部分和/归约后张量的布局差异。

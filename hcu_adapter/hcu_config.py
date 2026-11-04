@@ -55,6 +55,50 @@ class HcuConfigError(RuntimeError):
 # backends   selectable backend -> {status, note}
 
 BACKEND_CATALOG = {
+    "sglang_grouped_topk": {
+        "var": None,
+        "summary": "SGLang biased single-group MoE routing",
+        "backends": {
+            "torch": {"status": "validated", "note": "Default current upstream dispatch"},
+            "triton": {
+                "status": "candidate",
+                "note": "Opt-in upstream fused router for FP32 288-expert top8 "
+                        "single-group prefill M>=32; preserves renormalize epsilon and "
+                        "fallback. Full-model validation pending.",
+            },
+        },
+    },
+    "int8_scaled_mm": {
+        "var": None,
+        "summary": "SGLang symmetric per-token/per-channel INT8 dense GEMM",
+        "backends": {
+            "triton": {"status": "validated", "note": "Default stride-aware INT32 accumulation with FP32 scales and optional bias"},
+            "lightop": {"status": "candidate", "note": "Opt-in BF16 prefill M>=32, K multiple128, N multiple64, column-major weight, no bias; other cases retain Triton. Full-model validation pending."},
+        },
+    },
+    "hicache_mla_transfer": {
+        "var": None,
+        "summary": "MLA HiCache byte transfers through device pointer tables and pinned host memory",
+        "backends": {
+            "triton": {"status": "candidate", "note": "Layer-first and page-first MLA transfers; model validation pending"},
+        },
+    },
+    "sglang_mla_sparse": {
+        "var": None,
+        "summary": "SGLang BF16 NoPE sparse MLA interface",
+        "backends": {
+            "emu": {"status": "candidate", "note": "Default Torch compatibility implementation"},
+            "dtk": {"status": "candidate", "note": "Opt-in H1-64 D512 topk2048-2112 native FlashMLA; unsupported shapes retain emulation; full model validation pending"},
+        },
+    },
+    "sglang_mla_fp8": {
+        "var": None,
+        "summary": "SGLang V32_NO_ROPE packed E4M3 sparse MLA decode",
+        "backends": {
+            "emu": {"status": "candidate",
+                    "note": "SGLang-only 528-byte rows; FP32 attention; model validation pending"},
+        },
+    },
     "silu_and_mul": {
         "var": "HCU_SILU_MUL_IMPL",
         "summary": "gated activation out = silu(x[:,:d]) * x[:,d:]",
@@ -170,11 +214,18 @@ BACKEND_CATALOG = {
                  "deepgemm": {"HCU_MQA_LOGITS_IMPL": "vendor"}},
         "summary": "DSA paged MQA logits",
         "backends": {
-            "emu": {"status": "production",
-                    "note": "torch emulation — correct opt-out "
+            "emu": {"status": "candidate",
+                    "note": "2026-10-30: restored upstream per-head ReLU before "
+                            "weighted reduction; earlier parity shared the same "
+                            "missing-ReLU bug. Corrected long-context serving pending. "
+                            "torch emulation — opt-out "
                             "(HCU_MQA_LOGITS_IMPL=vec; pre-R-13#4 default)"},
-            "triton": {"status": "production",
-                       "note": "homegrown triton kernel (mqa_logits_triton.py, "
+            "triton": {"status": "candidate",
+                       "note": '2026-11-01: ragged prefill N>=32,D=128 uses 32x128 BF16 matrix tiles after exact E4M3 decode, preserving per-head ReLU and row windows; small batches keep vector reduction. Numerical and changing-input Graph probes passed; whole-model performance/accuracy revalidation pending. ' + "2026-10-30: restored upstream per-head ReLU in paged "
+                               "and ragged kernels; bounded head loop avoids static "
+                               "unrolling of all 32 heads. Earlier evidence below "
+                               "predates this correction; serving revalidation pending. "
+                               "homegrown triton kernel (mqa_logits_triton.py, "
                                "R-02 2026-10-18) — DEFAULT since R-13 #4 "
                                "promotion 2026-10-18 (HCU_MQA_LOGITS_IMPL, "
                                "was emu-vec). Reads the production "
@@ -377,6 +428,14 @@ BACKEND_CATALOG = {
                                "the default is inert on this model -- "
                                "promote when a model exercising the "
                                "triton core passes serving A/B."},
+        },
+    },
+    "sglang_tree_sampling": {
+        "var": None,
+        "summary": "SGLang target-only speculative tree sampling",
+        "backends": {
+            "triton": {"status": "candidate",
+                       "note": "Tree traversal, residual mass and CDF sampling; FP32 contiguous upstream ABI; full stochastic serving pending"},
         },
     },
     "sampling": {

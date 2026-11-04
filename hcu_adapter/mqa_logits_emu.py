@@ -1,7 +1,7 @@
 """torch emulation of the aiter fp8 MQA-logits kernels (HCU gfx936-class).
 
 The DTK aiter wheel's paged/ragged MQA-logits triton kernels hard-gate on
-gfx942/gfx950. On gfx936-class DCUs (BW200: no fp8 matrix unit, no MFMA
+gfx942/gfx950. On gfx936-class HCUs (BW200: no fp8 matrix unit, no MFMA
 definitions in triton 3.6) emulate them with torch: dequantize e4m3 via the
 dtype catwalk (encoder and decoder always share sglang's is_fp8_fnuz choice,
 so the convention matches by construction), then batched bf16 GEMMs with fp32
@@ -89,7 +89,7 @@ def _paged_mqa_logits(
             kg = k_b[pt]  # [Qq, Tt, D]
             sc = k_scale[pt].unsqueeze(1)  # [Qq, 1, Tt]
             scores = torch.matmul(qb, kg.transpose(1, 2)).float()  # [Qq, H, Tt]
-            row = (scores * w[i0:i1].unsqueeze(-1) * sc).sum(dim=1)  # [Qq, Tt]
+            row = (scores.relu() * w[i0:i1].unsqueeze(-1) * sc).sum(dim=1)  # [Qq, Tt]
             valid = ar[: t1 - t0].unsqueeze(0) + t0 < seq[i0:i1].unsqueeze(1)
             logits[i0:i1, t0:t1] = torch.where(valid, row, 0.0)
     return logits
@@ -122,7 +122,7 @@ def _ragged_fp8_mqa_logits(
             kt = k_b[t0:t1].transpose(0, 1)  # [D, Tt]
             scores = torch.matmul(qb, kt.unsqueeze(0))  # [Qq, H, Tt]
             sc = k_scale[t0:t1]
-            row = (scores.float() * sc.view(1, 1, -1) * w[i0:i1].unsqueeze(-1)).sum(
+            row = (scores.float().relu() * sc.view(1, 1, -1) * w[i0:i1].unsqueeze(-1)).sum(
                 dim=1
             )
             valid = (ar[: t1 - t0].unsqueeze(0) + t0 >= ks[i0:i1].unsqueeze(1)) & (

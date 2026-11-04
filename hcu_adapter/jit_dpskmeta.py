@@ -446,6 +446,7 @@ def install():
             LOG.info("jit_dpskmeta: %s absent (tree predates the module)", relpath)
             continue
         text = p.read_text(encoding="utf-8")
+        original_text = text
 
         # self-heal trees carrying superseded patches
         for old_repl, original in _UNDO.get(relpath, []):
@@ -463,7 +464,8 @@ def install():
                 )
             text = text.replace(needle, repl)
 
-        _atomic_write(p, text)
+        if text != original_text:
+            _atomic_write(p, text)
 
         target = f"text:sglang/kernels/jit/csrc/{relpath}"
         for needle, _ in needles:
