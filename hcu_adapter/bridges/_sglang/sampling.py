@@ -11,6 +11,8 @@ def top_p_renorm_probs(probs, top_p):
 
 
 def install():
+    install_grammar_bitmask()
+
     import importlib
     import sys
 
@@ -44,3 +46,38 @@ def install():
         registry.MECH_REBIND,
         detail="Target-only tree traversal and residual sampling without FlashInfer headers",
     )
+
+
+def install_grammar_bitmask():
+    import functools
+
+    import torch
+
+    if not getattr(torch.version, "hip", None):
+        return
+
+    from sglang.kernels.ops.grammar.bitmask_ops import apply_token_bitmask_inplace_kernel
+
+    from hcu_adapter import registry
+
+    kernel = apply_token_bitmask_inplace_kernel
+    original = kernel.run
+    if getattr(original, "_hcu_grammar_launch", False):
+        return
+
+    @functools.wraps(original)
+    def run(*args, **kwargs):
+        if args and args[0].device.type == "cuda":
+            properties = torch.cuda.get_device_properties(args[0].device)
+            warp_size = getattr(properties, "warp_size", 64)
+            kwargs["num_warps"] = min(kwargs.get("num_warps", 4), 1024 // warp_size)
+        return original(*args, **kwargs)
+
+    run._hcu_grammar_launch = True
+    registry.register(
+        "sampling", run,
+        "sglang.kernels.ops.grammar.bitmask_ops.apply_token_bitmask_inplace_kernel.run",
+        registry.MECH_REBIND,
+        detail="Bound grammar Triton launch to 1024 threads using the hardware warp size",
+    )
+    kernel.run = run

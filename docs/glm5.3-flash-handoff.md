@@ -2,6 +2,30 @@
 
 本文交接当前候选源码、启动入口、已有证据与未完成事项。它不是生产验收报告。
 
+## 2026-11-05 grammar mask 启动线程兼容
+
+用户在原 P 启动入口重启后，首次 grammar mask 调用报 Triton
+`OutOfResources: threads, Required: 2048, Hardware limit: 1024`。
+官方 `bitmask_ops.py` 对 FP32 logits 选择 32 warps；gfx936 的 warp size
+为 64，导致单 block 超过 1024 线程。该失败已在同镜像独立探针复现。
+
+修复位于 adapter 的 `hcu_adapter/bridges/_sglang/sampling.py`，属于既有
+采样能力的硬件启动兼容，不新增计算档位。采样桥安装时只包装该 JIT
+kernel 对象的 `run`，按实际设备 warp size 限制 `num_warps`；仍调用
+当前原始 launcher，保留其 dtype、shape、索引和 bitmask 数学语义。
+预导入的公共函数及 xgrammar 别名继续引用同一个 kernel 对象，因此无需
+替换调用者或编辑官方源码。非 HIP 环境不安装；CPU 输入不查询 GPU；
+重复安装不叠加包装。运行绑定以 `sampling` 登记到 adapter registry，
+未新增环境变量、catalog 档位或配置 UI 项。
+
+本次验证：5 项离线接缝回归通过；L0 GREEN，32 条历史 bare-environ
+警告；a12r4n13 的 plugin-dev（Python 3.10、Torch 2.11、gfx936）通过
+21 项 GPU 检查，包含 FP32/FP16/BF16、奇数及模型规模词表、指定行、
+一维输入和变 logits/bitmask 的 Graph replay，均与参考逐位一致。
+原始失败和 GPU 结果在实验目录 `grammar-launch-fix/gpu-probe.log`，
+探针在同目录 `probe.py`。本次算子检查不等于重新完成 P/D 启动和数据集
+精度验收；服务集成另行核验。原历史源码清单保留快照语义。
+
 ## 交付版本与来源
 
 - Plugin：HYGON-AI/sglang-plugin-das，`feat/glm5.3-flash`；本地基底 `405b8dc`。
