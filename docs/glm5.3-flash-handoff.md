@@ -27,7 +27,7 @@ P 后续原参数启动通过，完整 P/D 算术请求返回 2，`finish_reason
 
 ## 2026-11-06 完整数据集结果与后续缓存故障
 
-原 context-fix 组合完成 AIME25 **25/30（83.33%）**、HumanEval **163/164（99.39%）**，预测、review、配置和 report 位于 `perfopt-20261105/accuracy-contextfix/`，逐题证据为 `badcase-evidence.json`。AIME 零基索引 12/14/29 均生成 64000 tokens、`max_tokens` 结束且最终预测为空；20 将点 C=(-15,0) 到直线 x=9-x 的距离误写成 9-x（应为 24-x），输出 1753 而目标为 293；23 将 9+120+10 误算成 149（应为 139），最终输出 159 而目标为 149。HumanEval/132 反复推敲/重建括号算法后达到 64000 tokens，最终 completion 为空，判题首个断言失败。以上区分截断和数学错误，未据此证明机械复读或 adapter 数值漂移，也不宣称 handoff 精度问题已全部解决。
+原 context-fix 组合完成 AIME25 **25/30（83.33%）**、HumanEval **163/164（99.39%）**，预测、review、配置和 report 位于 `perfopt-20261105/accuracy-contextfix/`，逐题证据为 `badcase-evidence.json`。AIME 零基索引 12/14/29 均生成 64000 tokens、`max_tokens` 结束且最终预测为空；20 将点 C=(-15,0) 到竖直边 GH 的水平距离误写成 9-x（应为 24-x），输出 1753 而目标为 293；23 将 9+120+10 误算成 149（应为 139），最终输出 159 而目标为 149。HumanEval/132 反复推敲/重建括号算法后达到 64000 tokens，最终 completion 为空，判题首个断言失败。以上区分截断和数学错误，未据此证明机械复读或 adapter 数值漂移，也不宣称 handoff 精度问题已全部解决。
 
 原评测脚本的顶层 `enable_thinking=false` 被当前官方 ChatCompletionRequest 忽略；CPU 实测解析结果的 `chat_template_kwargs` 为 None，嵌套字段可进入该参数。实际本轮包含长 reasoning，成绩保留原脚本的真实语义，不称为关闭思考的分数；字段可进入解析也不单独证明特定模型模板遵循该开关。
 
@@ -36,6 +36,8 @@ P 后续原参数启动通过，完整 P/D 算术请求返回 2，`finish_reason
 仅 CP 修复的三轮基线只有首轮有效，Mean TTFT 16480.66ms、时长 27.56 秒；第二轮预热在 Mamba checkpoint 报 `Can not alloc mamba cache`。原生 fork 的压力分支会释放已消费的 COW 源状态锁。plugin `a403228` 将此生命周期处理接在原结果 snapshot 之后，仅对已完成 `copy_done` fence 的 HCU GLM extend 批次释放旧 Mamba 锁，保留 FULL KV 锁并更新 receipt。未打开 lazy buffer，也未增加原来的 96 个槽位。真实 8-GPU 满池反例旧路径失败，候选全部通过，复用旧 slot 不影响两个请求的自有 COW 状态；仓内 8-rank 缓存/压力测试同样通过。
 
 该锁修复与 CP 协调已部署，P 于 17:34 重启，manifest 为 `mamba-lock-fix-deployment.json`。新一轮长前缀 2/2/7 均正常结束，后两次 cached_tokens=3840；`p-f14-cowfix-baseline3/` 正在执行三轮同硬件稳定基线。normal INT8 异步计数仍是独立候选，尚未部署；最终组合的精度回归待执行，不能混用前后版本的精度与性能。
+
+17:34 组合仍在第二轮预热报槽位不足，只有首轮有效（Mean TTFT 16595.32ms）。后续定向库存复现确认：失败的三个 rank 各有 47 个 pending HiCache 写回节点，7 个完成 ACK 覆盖 43 个节点，但全 rank 最小完成数被其他 rank 的空队列压为零，写回锁无法回收。plugin `e3d020f` 将本地写回回收限定到 GLM CP LayerSplit、attention TP=1/PP=1、write_through、cache 模式且无 L3；原 ACK synchronize/锁释放、load 和全局 ready-count/digest 同步保留。真实 8-GPU 资源反例与正式 Hook 回归通过，D2H 快照逐位一致；整服务原参数重启与 `p-f14-writeack-baseline3/` 三轮压力待完成。另一项释放新 checkpoint 锁的局部候选已回退且从未部署，不能把它作为本轮根因修复。临时异常诊断已清理，normal INT8 异步计数仍未部署。
 
 ## 2026-11-05 grammar mask 启动线程兼容
 
