@@ -25,6 +25,18 @@ D 持续负载复采 `d-4k-contextfix-trace2/`：同为 940 次 dispatch，rank 
 
 P 后续原参数启动通过，完整 P/D 算术请求返回 2，`finish_reason=stop`。同硬件 P 首轮 4K/1/128、128 请求 Mean TTFT 16208.13ms、Median 16289.76ms、P99 27663.54ms、时长 27.75 秒；改前为 17100.24/16604.38/39353.47ms、39.44 秒。单轮有波动，不承诺稳定提速倍数。`p-f14-contextfix-trace1/` 已导出 8 rank，rank 0 一次 i8 GEMM 耗时 4.085 秒，其余调用中位数 1.563ms，rank 1 中位数 1.507ms，不能解释为持续 FFN 不均衡。P 的旧 gateway 仍保留约 150MB GPU 0 上下文，其他 CPU worker 和跨卡 scheduler 不再分配本卡外显存。AIME25/HumanEval 于 14:37 并行启动，使用 `/home/work/eval.sh` 副本，仅修改数据集、模型、API 端点和结果目录，生成配置保持；分数与 badcase 待完整结果。
 
+## 2026-11-06 完整数据集结果与后续缓存故障
+
+原 context-fix 组合完成 AIME25 **25/30（83.33%）**、HumanEval **163/164（99.39%）**，预测、review、配置和 report 位于 `perfopt-20261105/accuracy-contextfix/`，逐题证据为 `badcase-evidence.json`。AIME 零基索引 12/14/29 均生成 64000 tokens、`max_tokens` 结束且最终预测为空；20 将点 C=(-15,0) 到直线 x=9-x 的距离误写成 9-x（应为 24-x），输出 1753 而目标为 293；23 将 9+120+10 误算成 149（应为 139），最终输出 159 而目标为 149。HumanEval/132 反复推敲/重建括号算法后达到 64000 tokens，最终 completion 为空，判题首个断言失败。以上区分截断和数学错误，未据此证明机械复读或 adapter 数值漂移，也不宣称 handoff 精度问题已全部解决。
+
+原评测脚本的顶层 `enable_thinking=false` 被当前官方 ChatCompletionRequest 忽略；CPU 实测解析结果的 `chat_template_kwargs` 为 None，嵌套字段可进入该参数。实际本轮包含长 reasoning，成绩保留原脚本的真实语义，不称为关闭思考的分数；字段可进入解析也不单独证明特定模型模板遵循该开关。
+
+全集结束后的 P 稳定基线在首个重复 4K 请求卡住。非阻塞栈及 locals 证明 CP rank 0/3 的逻辑新 token 数分别为 4096/256；watchdog 的缓存 census 是在途快照，不是独立的泄漏证据。自动 py-spy 又停住全部 scheduler，现场和终止记录已保存。新增前缀协调归 plugin，详见其开发记录：原 upstream match/COW 保留，共同可用 prefix 通过 attention CPU groups 协调，不一致时重新 lookup，未关闭 HiCache、CP 或 SBO。8-rank 真实缓存回归及 P/D 长前缀 2/2/7 集成通过，实际 cached_tokens=3840。
+
+仅 CP 修复的三轮基线只有首轮有效，Mean TTFT 16480.66ms、时长 27.56 秒；第二轮预热在 Mamba checkpoint 报 `Can not alloc mamba cache`。原生 fork 的压力分支会释放已消费的 COW 源状态锁。plugin `a403228` 将此生命周期处理接在原结果 snapshot 之后，仅对已完成 `copy_done` fence 的 HCU GLM extend 批次释放旧 Mamba 锁，保留 FULL KV 锁并更新 receipt。未打开 lazy buffer，也未增加原来的 96 个槽位。真实 8-GPU 满池反例旧路径失败，候选全部通过，复用旧 slot 不影响两个请求的自有 COW 状态；仓内 8-rank 缓存/压力测试同样通过。
+
+该锁修复与 CP 协调已部署，P 于 17:34 重启，manifest 为 `mamba-lock-fix-deployment.json`。新一轮长前缀 2/2/7 均正常结束，后两次 cached_tokens=3840；`p-f14-cowfix-baseline3/` 正在执行三轮同硬件稳定基线。normal INT8 异步计数仍是独立候选，尚未部署；最终组合的精度回归待执行，不能混用前后版本的精度与性能。
+
 ## 2026-11-05 grammar mask 启动线程兼容
 
 用户在原 P 启动入口重启后，首次 grammar mask 调用报 Triton
