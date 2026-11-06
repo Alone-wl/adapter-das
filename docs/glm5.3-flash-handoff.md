@@ -23,6 +23,8 @@ weak-ref 保留原 native 符号及失败时 view fallback，将 ABI dummy 探�
 
 D 持续负载复采 `d-4k-contextfix-trace2/`：同为 940 次 dispatch，rank 1 累计 0.286 秒（改前 146.354 秒），rank 0 GPU 时间跨度 1.981 秒（改前 178.344 秒）；这是 trace 等待改善，输入状态和实际接受长度并非逐条锁定，不能称纯算子提速倍数。新轮 4K/256/128、2048 请求正式结果：平均 ITL 36.41ms，Mean TTFT 777.76ms，时长 175.83 秒，11.65 req/s。两次 profile 可能影响该轮时延；旧轮仅完成预热，没有正式吞吐 A/B。待完成 P 原参数启动、同硬件 P A/B 与新 profile、真实 P/D 请求及 AIME25/HumanEval 回归。SCNet 公网 SSH 间歇失败不代表服务退出，不重复加载模型。内网 `zz-login03/04` 已解析为 `10.13.17.103/104`，login03 已经跳板登录；未发现公网直连入口。
 
+P 后续原参数启动通过，完整 P/D 算术请求返回 2，`finish_reason=stop`。同硬件 P 首轮 4K/1/128、128 请求 Mean TTFT 16208.13ms、Median 16289.76ms、P99 27663.54ms、时长 27.75 秒；改前为 17100.24/16604.38/39353.47ms、39.44 秒。单轮有波动，不承诺稳定提速倍数。`p-f14-contextfix-trace1/` 已导出 8 rank，rank 0 一次 i8 GEMM 耗时 4.085 秒，其余调用中位数 1.563ms，rank 1 中位数 1.507ms，不能解释为持续 FFN 不均衡。P 的旧 gateway 仍保留约 150MB GPU 0 上下文，其他 CPU worker 和跨卡 scheduler 不再分配本卡外显存。AIME25/HumanEval 于 14:37 并行启动，使用 `/home/work/eval.sh` 副本，仅修改数据集、模型、API 端点和结果目录，生成配置保持；分数与 badcase 待完整结果。
+
 ## 2026-11-05 grammar mask 启动线程兼容
 
 用户在原 P 启动入口重启后，首次 grammar mask 调用报 Triton
