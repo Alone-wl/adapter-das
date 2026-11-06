@@ -218,6 +218,103 @@ def test_bootstrap_bridges_wire_both_guards():
     assert "watchdog_cold.install()" in sglang
 
 
+def test_cold_arch_probe_uses_topology_without_initializing_cuda():
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    properties = Mock(side_effect=AssertionError("cold CUDA property query"))
+    fake_torch = SimpleNamespace(cuda=SimpleNamespace(
+        is_available=lambda: True, is_initialized=lambda: False,
+        get_device_properties=properties,
+    ))
+    with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+        hcu_env, "_sysfs_arch_name", return_value="gfx936", create=True
+    ):
+        assert hcu_env.arch_name() == "gfx936"
+    properties.assert_not_called()
+
+
+def test_topology_arch_probe_rejects_mixed_or_invalid_metadata():
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as directory:
+        nodes = pathlib.Path(directory)
+        for index, version in enumerate((0, 90306, 90306)):
+            node = nodes / str(index)
+            node.mkdir()
+            (node / "properties").write_text(
+                f"simd_count {320 if version else 0}\ngfx_target_version {version}\n"
+            )
+        with patch.object(hcu_env, "_KFD_TOPOLOGY_ROOT", nodes, create=True):
+            assert hcu_env._sysfs_arch_name() == "gfx936"
+            (nodes / "2/properties").write_text("simd_count 320\ngfx_target_version 90308\n")
+            assert hcu_env._sysfs_arch_name() == ""
+            (nodes / "2/properties").write_text("simd_count 320\ngfx_target_version invalid\n")
+            assert hcu_env._sysfs_arch_name() == ""
+
+
+def test_aiter_layout_probe_reads_source_without_importing_sglang():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        source = root / "srt/distributed/device_communicators/custom_all_reduce.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("from aiter.dist.device_communicators import CustomAllreduce\n")
+        spec = SimpleNamespace(origin=str(root / "__init__.py"))
+        with patch("importlib.util.find_spec", return_value=spec), patch.dict(
+            sys.modules, {"sglang": None}
+        ):
+            assert hcu_env._sglang_uses_new_aiter_ca()
+            source.write_text("from aiter import CustomAllreduce\n")
+            assert not hcu_env._sglang_uses_new_aiter_ca()
+
+
+def test_ar_norm_availability_does_not_import_gpu_communicator():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    with patch.dict(sys.modules, {
+        "torch": SimpleNamespace(version=SimpleNamespace(hip="6.4")),
+        "aiter": None,
+    }), patch.object(hcu_env, "_package_source", return_value="class CustomAllreduce: pass"), patch.object(
+        hcu_env, "_auto_aiter_ar", return_value="allowed"
+    ):
+        assert hcu_env._auto_ar_norm_impl() == "aiter"
+    with patch.dict(sys.modules, {
+        "torch": SimpleNamespace(version=SimpleNamespace(hip="6.4")),
+    }), patch.object(hcu_env, "_package_source", return_value=""):
+        assert hcu_env._auto_ar_norm_impl() == "stock"
+
+
+def test_quant_availability_does_not_import_vendor_package():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    with patch.dict(sys.modules, {
+        "torch": SimpleNamespace(version=SimpleNamespace(hip="6.4")),
+        "aiter": None,
+    }), patch("importlib.util.find_spec", return_value=SimpleNamespace()):
+        assert hcu_env._auto_quant_impl() == "aiter"
+
+
+def test_initialized_arch_probe_preserves_actual_device_properties():
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    properties = Mock(return_value=SimpleNamespace(gcnArchName="gfx90a:sramecc+"))
+    fake_torch = SimpleNamespace(cuda=SimpleNamespace(
+        is_available=lambda: True, is_initialized=lambda: True,
+        get_device_properties=properties,
+    ))
+    with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+        hcu_env, "_sysfs_arch_name", side_effect=AssertionError("unexpected topology probe")
+    ):
+        assert hcu_env.arch_name() == "gfx90a"
+    properties.assert_called_once_with(0)
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

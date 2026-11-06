@@ -78,9 +78,6 @@ def install():
 
         if not torch.version.hip:
             return
-        from aiter.dist.device_communicators.custom_all_reduce import (  # noqa: F401
-            CustomAllreduce,
-        )
         from sglang.srt.layers import flashinfer_comm_fusion as _fcf
         from sglang.srt.layers.layer_boundary import exit as _lb_exit
         from sglang.srt.layers.layer_boundary.fusions import (

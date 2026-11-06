@@ -74,6 +74,179 @@ def test_platform_env_defaults():
         assert all(os.environ.get(k) for k in A_TIER), "idempotent"
 
 
+def test_gfx_guard_precedes_runner_utils_import():
+    import builtins
+    import functools
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import Mock, patch
+    from hcu_adapter import hcu_env, platform_seam, registry
+
+    modules = {}
+    for name in (
+        "sglang", "sglang.srt", "sglang.srt.platforms", "sglang.srt.utils",
+        "sglang.srt.utils.common", "sglang.srt.model_executor",
+        "sglang.srt.model_executor.runner_utils",
+        "sglang.srt.layers", "sglang.srt.layers.moe", "sglang.srt.layers.moe.utils",
+    ):
+        module = ModuleType(name)
+        module.__path__ = []
+        modules[name] = module
+        parent, _, child = name.rpartition(".")
+        if parent:
+            setattr(modules[parent], child, module)
+    common = modules["sglang.srt.utils.common"]
+    package = modules["sglang.srt.utils"]
+    common.is_gfx1250_supported = lambda: True
+    package.is_gfx1250_supported = common.is_gfx1250_supported
+    common.is_cuda = lambda: False
+    package.is_cuda = common.is_cuda
+    common._check_cuda_device_version = lambda: True
+    common.is_sm90_supported = functools.lru_cache()(functools.partial(common._check_cuda_device_version))
+    package.is_sm90_supported = common.is_sm90_supported
+    original_capability = Mock(return_value=(7, 5))
+    original_capability._hcu_device_capability = False
+    original_current_device = Mock(return_value=7)
+    original_current_device._hcu_current_device = False
+    common.get_device_capability = lambda device_id=0: torch.cuda.get_device_capability(device_id)
+    package.get_device_capability = common.get_device_capability
+    observed = []
+    event_module = SimpleNamespace(make_external_event=lambda _: None)
+
+    def get_runner_attribute(name):
+        if name != "shared_read_event":
+            raise AttributeError(name)
+        observed.append((common.is_gfx1250_supported(), package.is_gfx1250_supported(),
+                         common.is_cuda(), package.is_cuda(), package.is_sm90_supported()))
+        return event_module
+
+    modules["sglang.srt.model_executor.runner_utils"].__getattr__ = get_runner_attribute
+
+    def parse_device(value):
+        if not isinstance(value, str):
+            return value
+        kind, _, index = value.partition(":")
+        return SimpleNamespace(type=kind, index=int(index) if index else None)
+
+    torch = SimpleNamespace(
+        version=SimpleNamespace(hip="6.4"),
+        cuda=SimpleNamespace(is_available=lambda: True, is_initialized=Mock(return_value=False),
+                             get_device_capability=original_capability,
+                             current_device=original_current_device),
+        float8_e4m3fn=object(), finfo=lambda _: SimpleNamespace(max=448),
+        device=parse_device,
+    )
+    with patch.dict(sys.modules, {**modules, "torch": torch}), patch.object(
+        hcu_env, "resolve", return_value=("cuda", "default")
+    ), patch.object(registry, "register"), patch.object(
+        builtins, "FP8_E4M3_MAX", None, create=True
+    ), patch.object(builtins, "FP8_E4M3_MIN", None, create=True), patch.object(
+        platform_seam, "_get_device_capability_via_hip", return_value=(9, 3)
+    ) as capability, patch.object(platform_seam, "_get_current_device_via_hip", return_value=3) as current:
+        platform_seam.install()
+        assert torch.cuda.current_device() == 3
+        original_current_device.assert_not_called()
+        assert package.get_device_capability is common.get_device_capability
+        assert common.get_device_capability(3) == (9, 3)
+        capability.assert_called_once_with(3)
+        original_capability.assert_not_called()
+        assert torch.cuda.get_device_capability("cuda:2") == (9, 3)
+        capability.assert_called_with(2)
+        assert torch.cuda.get_device_capability() == (9, 3)
+        capability.assert_called_with(None)
+        assert torch.cuda.get_device_capability(SimpleNamespace(type="cuda", index=5)) == (9, 3)
+        capability.assert_called_with(5)
+        torch.cuda.is_initialized.return_value = True
+        assert torch.cuda.current_device() == 7
+        original_current_device.assert_called_once()
+        assert common.get_device_capability(4) == (7, 5)
+        original_capability.assert_called_once_with(4)
+        torch.cuda.is_initialized.return_value = False
+        current.return_value = None
+        assert torch.cuda.current_device() == 7
+        capability.return_value = None
+        assert common.get_device_capability(2) == (7, 5)
+    assert observed and all(pair == (False, False, True, True, False) for pair in observed)
+
+
+def test_hip_device_capability_query_uses_metadata_attributes():
+    import ctypes
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+    from hcu_adapter import platform_seam
+
+    def query(pointer, attribute, device):
+        assert device == 0
+        pointer._obj.value = {36: 9, 37: 3}[attribute]
+        return 0
+
+    native = Mock(side_effect=query)
+    runtime = SimpleNamespace(hipDeviceGetAttribute=native)
+    with patch.object(ctypes, "CDLL", side_effect=[OSError("missing alias"), runtime]):
+        assert platform_seam._get_device_capability_via_hip() == (9, 3)
+    assert native.call_count == 2
+    with patch.object(ctypes, "CDLL", return_value=SimpleNamespace(
+        hipDeviceGetAttribute=Mock(return_value=1)
+    )):
+        assert platform_seam._get_device_capability_via_hip() is None
+    with patch.object(ctypes, "CDLL", side_effect=OSError("unavailable")):
+        assert platform_seam._get_device_capability_via_hip() is None
+
+    def current_device(pointer):
+        pointer._obj.value = 3
+        return 0
+
+    def query_current(pointer, attribute, device):
+        assert device == 3
+        pointer._obj.value = {36: 9, 37: 3}[attribute]
+        return 0
+
+    runtime = SimpleNamespace(
+        hipDeviceGetAttribute=Mock(side_effect=query_current),
+        hipGetDevice=Mock(side_effect=current_device),
+    )
+    with patch.object(ctypes, "CDLL", return_value=runtime):
+        assert platform_seam._get_device_capability_via_hip(None) == (9, 3)
+
+
+def test_moe_sbo_guard_uses_physical_hip_identity_and_updates_aliases():
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import patch
+    import pytest
+    from hcu_adapter import platform_seam, registry
+
+    module = ModuleType("sglang.srt.layers.moe.utils")
+    scheduler = ModuleType("sglang.srt.managers.scheduler")
+    torch = SimpleNamespace(version=SimpleNamespace(hip="6.4"), cuda=SimpleNamespace(
+        get_device_capability=lambda: (9, 3),
+    ))
+    requested = SimpleNamespace(sbo=True, tail=17)
+    state = SimpleNamespace()
+    module.__dict__.update(torch=torch, requested=requested, state=state, is_cuda=lambda: True)
+    exec("def initialize_moe_config():\n"
+         "    state.sbo_enabled = requested.sbo\n"
+         "    if state.sbo_enabled and is_cuda() and torch.cuda.get_device_capability()[0] == 9:\n"
+         "        raise ValueError('SM90 SBO rejected')\n"
+         "    state.tail = requested.tail\n", module.__dict__)
+    original = module.initialize_moe_config
+    scheduler.initialize_moe_config = original
+    with patch.dict(sys.modules, {
+        "torch": torch, module.__name__: module, scheduler.__name__: scheduler,
+    }), patch.object(registry, "register"):
+        with pytest.raises(ValueError, match="SM90"):
+            original()
+        platform_seam._install_moe_hardware_guard(module)
+        assert scheduler.initialize_moe_config is module.initialize_moe_config
+        scheduler.initialize_moe_config()
+        assert state.sbo_enabled and state.tail == 17
+        assert module.is_cuda()
+        requested.tail = 29
+        module.initialize_moe_config()
+        assert state.tail == 29
+        torch.version.hip = None
+        with pytest.raises(ValueError, match="SM90"):
+            module.initialize_moe_config()
+
+
 if __name__ == "__main__":
     try:
         test_platform_env_defaults()

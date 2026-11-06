@@ -42,6 +42,97 @@ _TARGETS = (
 )
 
 
+def _load_hip_runtime():
+    import ctypes
+
+    for library in ("libamdhip64.so", "libhip_hcc.so"):
+        try:
+            return ctypes.CDLL(library)
+        except OSError:
+            continue
+    return None
+
+
+def _get_current_device_via_hip(runtime=None):
+    import ctypes
+
+    runtime = runtime if runtime is not None else _load_hip_runtime()
+    if runtime is None:
+        return None
+    try:
+        current = ctypes.c_int()
+        query = runtime.hipGetDevice
+        query.argtypes = (ctypes.POINTER(ctypes.c_int),)
+        query.restype = ctypes.c_int
+        return current.value if query(ctypes.byref(current)) == 0 else None
+    except (AttributeError, OSError):
+        return None
+
+
+def _get_device_capability_via_hip(device_id=0):
+    import ctypes
+
+    runtime = _load_hip_runtime()
+    if runtime is None:
+        return None
+    try:
+        if device_id is None:
+            device_id = _get_current_device_via_hip(runtime)
+            if device_id is None:
+                return None
+        query = runtime.hipDeviceGetAttribute
+        query.argtypes = (ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int)
+        query.restype = ctypes.c_int
+        values = []
+        for attribute in (36, 37):
+            value = ctypes.c_int()
+            if query(ctypes.byref(value), attribute, device_id) != 0:
+                return None
+            values.append(value.value)
+        major, minor = values
+        if not 0 < major < 100 or not 0 <= minor < 10:
+            return None
+        return major, minor
+    except (AttributeError, OSError):
+        return None
+
+
+def _install_moe_hardware_guard(module):
+    import sys
+    from functools import wraps
+    from types import FunctionType
+
+    import torch
+
+    from hcu_adapter import registry
+
+    original = getattr(module, "initialize_moe_config", None)
+    if not isinstance(original, FunctionType) or getattr(original, "_hcu_moe_hardware", False):
+        return
+
+    @wraps(original)
+    def initialize(*args, **kwargs):
+        if torch.version.hip is None:
+            return original(*args, **kwargs)
+        adapted = FunctionType(
+            original.__code__, dict(original.__globals__, is_cuda=lambda: False),
+            original.__name__, original.__defaults__, original.__closure__,
+        )
+        adapted.__kwdefaults__ = original.__kwdefaults__
+        return adapted(*args, **kwargs)
+
+    initialize._hcu_moe_hardware = True
+    for name, namespace in tuple(sys.modules.items()):
+        if name.startswith("sglang.") and getattr(namespace, "__dict__", {}).get("initialize_moe_config") is original:
+            namespace.initialize_moe_config = initialize
+            registry.register(
+                "platform_detect", initialize,
+                target=f"{name}:initialize_moe_config",
+                mechanism=registry.MECH_REBIND,
+                detail="NVIDIA SM90 SBO guard uses physical HIP identity",
+            )
+
+
 def _install_gfx_probe_guard(_common):
     """Neutralize is_gfx*_supported arch probes.
 
@@ -164,6 +255,50 @@ def install():
     from sglang.srt import platforms as _pf
     from sglang.srt.utils import common as _common
 
+    original_current_device = torch.cuda.current_device
+    if not getattr(original_current_device, "_hcu_current_device", False):
+        def _hcu_current_device():
+            if torch.version.hip is not None and not torch.cuda.is_initialized():
+                device = _get_current_device_via_hip()
+                if device is not None:
+                    return device
+            return original_current_device()
+
+        _hcu_current_device._hcu_current_device = True
+        torch.cuda.current_device = _hcu_current_device
+        registry.register(
+            "platform_detect", _hcu_current_device,
+            target="torch.cuda:current_device",
+            mechanism=registry.MECH_REBIND,
+            detail="HIP current-device metadata before Torch CUDA initialization",
+        )
+
+    original_capability_query = torch.cuda.get_device_capability
+    if not getattr(
+        original_capability_query, "_hcu_device_capability", False
+    ):
+        def _hcu_device_capability(device=None):
+            if torch.version.hip is not None and not torch.cuda.is_initialized():
+                device_id = device
+                if device is not None and not isinstance(device, int):
+                    parsed = torch.device(device)
+                    if parsed.type != "cuda":
+                        return original_capability_query(device)
+                    device_id = parsed.index
+                capability = _get_device_capability_via_hip(device_id)
+                if capability is not None:
+                    return capability
+            return original_capability_query(device)
+
+        _hcu_device_capability._hcu_device_capability = True
+        torch.cuda.get_device_capability = _hcu_device_capability
+        registry.register(
+            "platform_detect", _hcu_device_capability,
+            target="torch.cuda:get_device_capability",
+            mechanism=registry.MECH_REBIND,
+            detail="HIP capability metadata before Torch CUDA initialization",
+        )
+
     #这两个 import 本身会执行 common.py 顶层 `if is_hip():` ——彼时判定
     # 还是原函数，fnuz 常量已被冻结并写进 builtins；patch 后必须重算
     # （CUDA 语义 = e4m3fn，max 448）。
@@ -197,23 +332,20 @@ def install():
         return False
 
     _common.is_flashinfer_available = _hcu_fi_available
+    # gcn 架构探针（is_gfx950_supported / is_gfx1250_supported，@lru_cache 无
+    # __wrapped__）：原实现走 torch.version.hip 真值分支后裸调
+    # get_device_properties(0) ——卡分区可见性（HIP_VISIBLE_DEVICES=8..15）
+    # 且 CUDA 尚未 init 的 sitecustomize 早期 import 顺序下直接
+    # "No CUDA GPUs are available"。HCU 是 gfx93x，这些门恒 False。
+    _install_gfx_probe_guard(_common)
 
     # torch HIP graph 拒收 external event（"External events are disallowed in
     # rocm"）；上游 shared_read_event.make_external_event 以 is_cuda 判定后调
     # Event(external=True)。HCU 硬件真值= HIP 无此能力，把上游的构造口替换
     # 为普通 Event（语义降级：外部读端 fastpath 关闭，与 is_cuda()=False 时
     # 上游行为一致——返回 None 正是它自己的降级臂）。
-    try:
-        from sglang.srt.model_executor.runner_utils import (
-            shared_read_event as _sre,
-        )
-
-        def _hcu_make_external_event(device_module):
-            return None
-
-        _sre.make_external_event = _hcu_make_external_event
-    except Exception:
-        pass
+    def _hcu_make_external_event(device_module):
+        return None
 
     _common.is_cuda = _hcu_is_cuda
     _common.is_hip = _hcu_is_hip
@@ -229,6 +361,7 @@ def install():
     # 上游走保守回退路径。按 __wrapped__ 精确识别，未来新增探针自动覆盖。
     import functools as _ft
 
+    _cuda_version_probes = {}
     for _name in list(vars(_common)):
         _v = getattr(_common, _name)
         _inner = getattr(_v, "__wrapped__", None)
@@ -236,14 +369,46 @@ def install():
             isinstance(_inner, _ft.partial)
             and _inner.func is getattr(_common, "_check_cuda_device_version", None)
         ):
-            setattr(_common, _name, lambda: False)
+            _probe = lambda: False
+            setattr(_common, _name, _probe)
+            _cuda_version_probes[_name] = _probe
 
-    # gcn 架构探针（is_gfx950_supported / is_gfx1250_supported，@lru_cache 无
-    # __wrapped__）：原实现走 torch.version.hip 真值分支后裸调
-    # get_device_properties(0) ——卡分区可见性（HIP_VISIBLE_DEVICES=8..15）
-    # 且 CUDA 尚未 init 的 sitecustomize 早期 import 顺序下直接
-    # "No CUDA GPUs are available"。HCU 是 gfx93x，这些门恒 False。
-    _install_gfx_probe_guard(_common)
+    # `sglang.srt.utils/__init__` does `from .common import *` when IT is
+    # first imported -- which happens as a side effect of our very own
+    # `from sglang.srt.utils import common` above. The package namespace
+    # therefore still holds the ORIGINAL callables; sync them (same for any
+    # other already-imported re-export layer).
+    import sglang.srt.utils as _pkg_utils
+
+    _sync = {
+        "is_cuda": _hcu_is_cuda,
+        "is_hip": _hcu_is_hip,
+        "is_cuda_alike": _hcu_is_cuda_alike,
+        "is_flashinfer_available": _hcu_fi_available,
+        **_cuda_version_probes,
+    }
+    for _n, _fn in _sync.items():
+        if getattr(_pkg_utils, _n, None) is not _fn:
+            setattr(_pkg_utils, _n, _fn)
+        if _n in _cuda_version_probes:
+            registry.register(
+                "platform_detect", _fn,
+                target=f"sglang.srt.utils:{_n}",
+                mechanism=registry.MECH_REBIND,
+                detail="Synchronize NVIDIA version probe aliases on HIP",
+            )
+    try:
+        from sglang.srt.model_executor.runner_utils import (
+            shared_read_event as _sre,
+        )
+
+        _sre.make_external_event = _hcu_make_external_event
+    except Exception:
+        pass
+
+    from sglang.srt.layers.moe import utils as _moe_utils
+
+    _install_moe_hardware_guard(_moe_utils)
 
     impls = {
         "sglang.srt.utils.common:is_cuda": _hcu_is_cuda,
@@ -262,23 +427,6 @@ def install():
             mechanism=registry.MECH_SEAM,
             detail=f"semantics={sem}",
         )
-
-    # `sglang.srt.utils/__init__` does `from .common import *` when IT is
-    # first imported -- which happens as a side effect of our very own
-    # `from sglang.srt.utils import common` above. The package namespace
-    # therefore still holds the ORIGINAL callables; sync them (same for any
-    # other already-imported re-export layer).
-    import sglang.srt.utils as _pkg_utils
-
-    _sync = {
-        "is_cuda": _hcu_is_cuda,
-        "is_hip": _hcu_is_hip,
-        "is_cuda_alike": _hcu_is_cuda_alike,
-        "is_flashinfer_available": _hcu_fi_available,
-    }
-    for _n, _fn in _sync.items():
-        if getattr(_pkg_utils, _n, None) is not _fn:
-            setattr(_pkg_utils, _n, _fn)
     LOG.warning(
         "HCU adapter: platform semantics seam installed "
         "(sglang answers CUDA; hw layers stay HIP-truthful)"

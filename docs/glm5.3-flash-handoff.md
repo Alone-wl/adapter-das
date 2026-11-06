@@ -2,6 +2,27 @@
 
 本文交接当前候选源码、启动入口、已有证据与未完成事项。它不是生产验收报告。
 
+## 2026-11-06 P/D 性能：冷启动 GPU 上下文候选
+
+当前实验使用官方 `baa9befa381511cd4d56f83980951e5a45fffc6d`、plugin `c661691` 的运行时内容和 adapter `f80832f`。plugin 后续 `e2e9966` 仅保留路径审计文档，运行时没有性能改动。P 在 `f14r1n14`，D 在 `f14r1n15/16`；原 `a12r4n13` 曾被 Slurm 标记 DOWN，不能将更换硬件的差异归因于代码。保留 INT8、EAGLE、CP、HiCache、DeepEP 与现有 Graph 配置，仍忽略 E。
+
+改前服务、trace 与冷启动探针位于容器 `/home/work/agent/das-glm53-tx-pd/perfopt-20261105/`；宿主 KFD 的 `kfd-node15-before.json` 已同步至该目录的 `cold-start/candidate/`：
+
+- `d-4k-trace1/`：D 使用参考压测入口，4K 输入、256 输出、并发 128；日志确认任一 rank 的 `#running-req: 8` 后等待 30 秒，再采集 CPU/GPU 10 steps，显式 `with_stack=false`。16 rank 全部导出。rank 0 trace 跨度约 198.64 秒，其中 `hipEventSynchronize` 为 178.87 秒；rank 1 的 DeepEP dispatch 累计 146.35 秒。不同类别存在重叠，不能相加成总耗时。rank 0 的 GPU 事件时间线上有 615 个超过 100ms 的空档，累计约 96.39 秒，很多接近 0.28 秒。此轮压力在导出完成后主动结束于预热阶段，不能给出正式吞吐分数。
+- 内核反复报告 GPU `0000:09:00.0` 的 `Over subscribed runlist, process_count:28,max_proc_per_quantum:8`。宿主 KFD 与 Docker PID 映射确认这些是本服务的进程：16 个 tokenizer worker、detokenizer、资源跟踪进程、控制器、主进程，以及其他 GPU 的 scheduler，均在 GPU 0 上保留约 150MB。此现象与通信等待相符，但提速因果仍待同配置 A/B。
+- `p-f14-baseline1/benchmark_results.csv`：同硬件 4K 输入、1 token 请求输出、128 并发，128 请求的 Mean TTFT 17100.24ms、Median 16604.38ms、P99 39353.47ms，时长 39.44 秒。经真实 P/D router 的短输出负载偏向 Prefill，但包含传输和 Decode 首步，不能当作纯 P 算子耗时。`p-f14-trace1/` 已导出 8 rank trace。
+- `cold-start/first-gpu-init-serving-env.log`：复制实际 D 主进程环境，在 CUDA 初始化前安装阻断探针，首次调用链为 `sitecustomize → bootstrap → common.install → hcu_env.log_summary → arch_name → torch.cuda.get_device_properties(0)`。探针阻止真实初始化，前后 `torch.cuda.is_initialized()` 均为 False。后续隔离还发现 weak-ref 的导入期 CUDA dummy tensor、AITER communicator 元数据探测，以及架构守卫安装晚于 `runner_utils` 导入。
+
+候选属于 adapter 的启动兼容与能力探测，已部署并完成 D 重启，P 正在复验。冷启动时使用同构 KFD topology 的 `gfx_target_version`；混合架构、缺失或非法元数据保留既有 Torch 属性查询。AITER/框架布局探测改查包来源与源码。Torch 的冷启动 current-device/capability 查询通过 HIP 元数据 API 返回，已初始化、非 HIP 或查询失败时保留原 API；HIP 属性枚举 36/37 已用镜像头文件编译核实。gfx/CUDA 版本守卫与公共重导出前移至 runner 导入前。AR+norm 不提前导入未使用的 communicator，实际 collective 仍由原 group 管理。plugin 的架构布尔检测在 adapter 共存时复用冷启动元数据，独立运行及已初始化路径仍查原设备属性。没有修改官方源码或添加环境变量。
+
+weak-ref 保留原 native 符号及失败时 view fallback，将 ABI dummy 探测推迟到首次非空输入的实际设备，按设备缓存；空 tensor 直接返回。实际 native 实现在空 tensor 上报 `cuda:0 versus cuda:-2`，原始失败已留存。`cold-start/weakref-gpu-probe-v5.py` 使用每设备独立 capture stream，通过 GPU 0/3、FP32/FP16/BF16、连续/转置/偏移/空 tensor 和首次 Graph capture、变输入 replay 共 42 项；native 在两卡及首次 capture 用例均实际选中。结果文件为 `weakref-gpu-result-v2.json`。不测试释放 owner 后的悬空引用，也不据此宣称支持该生命周期。
+
+首次 P 重启暴露 NVIDIA SM90 专用 SBO 禁止检查：CUDA 语义层把 HCU capability 9.3 误认成 SM90。adapter 仅在 `initialize_moe_config` 的函数作用域使用真实 HIP 身份，并同步已加载消费者别名；其余 CUDA 语义及 SBO 参数保持。非 HIP 原调用不变。当前 CPU 回归 66 项通过，L0 GREEN（32 项既有 bare-environ 警告）；覆盖安装时序、冷/热设备查询、native 延迟分发、fallback 及 SBO 物理硬件身份。CPU mock 不能代替整模型验收。
+
+`cold-start/cpu-audit-f14r1n14-v7.json` 与 n15 对应文件复制实际 P/D 环境，阻断任何 Torch CUDA 初始化，完整候选 bootstrap 及 plugin 检测均无初始化尝试，新 KFD 进程在全部 GPU 上 VRAM 为零。D 重启后健康检查 200，宿主 KFD 确认仅 8 个 scheduler 各占本卡，不再有 CPU worker 和其他卡 scheduler 的 GPU 0 显存。部署前后 SHA 与备份在 `context-fix-deployment.json` 和 `context-fix-backup/`，SBO 追加修复也记录前后 SHA。
+
+D 持续负载复采 `d-4k-contextfix-trace2/`：同为 940 次 dispatch，rank 1 累计 0.286 秒（改前 146.354 秒），rank 0 GPU 时间跨度 1.981 秒（改前 178.344 秒）；这是 trace 等待改善，输入状态和实际接受长度并非逐条锁定，不能称纯算子提速倍数。新轮 4K/256/128、2048 请求正式结果：平均 ITL 36.41ms，Mean TTFT 777.76ms，时长 175.83 秒，11.65 req/s。两次 profile 可能影响该轮时延；旧轮仅完成预热，没有正式吞吐 A/B。待完成 P 原参数启动、同硬件 P A/B 与新 profile、真实 P/D 请求及 AIME25/HumanEval 回归。SCNet 公网 SSH 间歇失败不代表服务退出，不重复加载模型。内网 `zz-login03/04` 已解析为 `10.13.17.103/104`，login03 已经跳板登录；未发现公网直连入口。
+
 ## 2026-11-05 grammar mask 启动线程兼容
 
 用户在原 P 启动入口重启后，首次 grammar mask 调用报 Triton

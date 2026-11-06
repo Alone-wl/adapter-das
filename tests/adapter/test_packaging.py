@@ -10,6 +10,87 @@ import zipfile
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_weakref_import_selects_native_symbol_without_cuda_allocation():
+    import importlib.util
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    class Tensor:
+        device = "cuda:3"
+
+        def numel(self):
+            return 8
+
+    native = Mock(return_value=object())
+    zeros = Mock(return_value=Tensor())
+    torch = SimpleNamespace(
+        Tensor=Tensor, zeros=zeros,
+        ops=SimpleNamespace(sgl_kernel=SimpleNamespace(weak_ref_tensor=native)),
+    )
+    with patch.dict(sys.modules, {
+        "torch": torch, "sgl_kernel.common_ops": SimpleNamespace(),
+    }):
+        spec = importlib.util.spec_from_file_location(
+            "weakref_import_contract", REPO_ROOT / "sgl_kernel/weak_ref.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        zeros.assert_not_called()
+        native.assert_not_called()
+        empty = Tensor()
+        empty.numel = lambda: 0
+        assert module.weak_ref_tensor(empty) is empty
+        zeros.assert_not_called()
+        tensor = Tensor()
+        assert module.weak_ref_tensor(tensor) is native.return_value
+        assert native.call_args_list[0].args == (zeros.return_value,)
+        assert native.call_args_list[1].args == (tensor,)
+        zeros.assert_called_once_with(1, device="cuda:3")
+        assert module.weak_ref_tensor(tensor) is native.return_value
+        assert native.call_count == 3
+        zeros.assert_called_once()
+        assert module.weak_ref_tensor(None) is None
+
+
+def test_weakref_failed_native_probe_keeps_view_fallback_on_tensor_device():
+    import importlib.util
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    class Tensor:
+        device = "cuda:3"
+
+        def numel(self):
+            return 8
+
+        def view_as(self, other):
+            assert other is self
+            return self
+
+    native = Mock(side_effect=ValueError("invalid device ABI"))
+    alternate = Mock(side_effect=ValueError("invalid device ABI"))
+    zeros = Mock(return_value=Tensor())
+    torch = SimpleNamespace(
+        Tensor=Tensor, zeros=zeros,
+        ops=SimpleNamespace(sgl_kernel=SimpleNamespace(weak_ref_tensor=native)),
+    )
+    with patch.dict(sys.modules, {
+        "torch": torch, "sgl_kernel.common_ops": SimpleNamespace(weak_ref_tensor=alternate),
+    }):
+        spec = importlib.util.spec_from_file_location(
+            "weakref_fallback_contract", REPO_ROOT / "sgl_kernel/weak_ref.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        zeros.assert_not_called()
+        tensor = Tensor()
+        assert module.weak_ref_tensor(tensor) is tensor
+        assert module.weak_ref_tensor(tensor) is tensor
+        zeros.assert_called_once_with(1, device="cuda:3")
+        native.assert_called_once()
+        alternate.assert_called_once()
+
+
 def test_wheel_contains_bootstrap_and_nested_adapter_packages(tmp_path):
     source = tmp_path / "source"
     wheel_dir = tmp_path / "wheel"

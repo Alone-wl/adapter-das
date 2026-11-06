@@ -14,8 +14,39 @@ default. Never hard-fail on an unknown value: log and fall back.
 
 import logging
 import os
+import importlib.util
+from pathlib import Path
 
 LOG = logging.getLogger("hcu.adapter")
+_KFD_TOPOLOGY_ROOT = Path("/sys/class/kfd/kfd/topology/nodes")
+
+
+def _sysfs_arch_name():
+    architectures = set()
+    try:
+        for path in _KFD_TOPOLOGY_ROOT.glob("*/properties"):
+            properties = dict(line.split(maxsplit=1) for line in path.read_text().splitlines())
+            if int(properties.get("simd_count", "0")) <= 0:
+                continue
+            version = int(properties.get("gfx_target_version", "0"))
+            if version <= 0:
+                return ""
+            architectures.add(
+                f"gfx{version // 10000}{(version // 100) % 100:x}{version % 100:x}"
+            )
+    except (OSError, ValueError):
+        return ""
+    return architectures.pop() if len(architectures) == 1 else ""
+
+
+def _package_source(package, relative):
+    try:
+        spec = importlib.util.find_spec(package)
+        if spec is None or spec.origin is None:
+            return ""
+        return (Path(spec.origin).parent / relative).read_text(encoding="utf-8")
+    except (ImportError, OSError, ValueError):
+        return ""
 
 
 def arch_name():
@@ -25,6 +56,10 @@ def arch_name():
 
         if not torch.cuda.is_available():
             return ""
+        if not torch.cuda.is_initialized():
+            architecture = _sysfs_arch_name()
+            if architecture:
+                return architecture
         return (
             torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         )
@@ -51,14 +86,10 @@ def has_fp8(arch=None):
 def _sglang_uses_new_aiter_ca():
     """True when this sglang build's AR dispatch goes through the NEW
     aiter.dist GraphSafe path (source marker check; no aiter import)."""
-    try:
-        import sglang.srt.distributed.device_communicators.\
-            custom_all_reduce as car
-
-        with open(car.__file__, encoding="utf-8", errors="ignore") as f:
-            return "aiter.dist.device_communicators" in f.read()
-    except Exception:
-        return False
+    source = _package_source(
+        "sglang", "srt/distributed/device_communicators/custom_all_reduce.py"
+    )
+    return "aiter.dist.device_communicators" in source
 
 
 def _auto_aiter_ar():
@@ -81,9 +112,8 @@ def _auto_quant_impl():
         import torch
 
         if getattr(torch.version, "hip", None) is not None:
-            import aiter  # noqa: F401
-
-            return "aiter"
+            if importlib.util.find_spec("aiter") is not None:
+                return "aiter"
     except Exception:
         pass
     return "stock"
@@ -98,9 +128,11 @@ def _auto_ar_norm_impl():
 
         if getattr(torch.version, "hip", None) is None:
             return "stock"
-        from aiter.dist.device_communicators.custom_all_reduce import (  # noqa: F401
-            CustomAllreduce,
+        source = _package_source(
+            "aiter", "dist/device_communicators/custom_all_reduce.py"
         )
+        if "class CustomAllreduce" not in source:
+            return "stock"
     except Exception:
         return "stock"
     if _auto_aiter_ar().startswith("refused"):

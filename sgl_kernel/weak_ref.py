@@ -21,6 +21,18 @@ pessimistic — capture-time pinning, gap-listed).
 import torch
 
 
+def _fallback_weak_ref_tensor(t):
+    if not isinstance(t, torch.Tensor):
+        raise TypeError(f"weak_ref_tensor expects a Tensor, got {type(t)!r}")
+    if t.numel() == 0:
+        return t
+    # Strong-reference stand-in: view with identical shape/stride/layout.
+    # (The upstream C++ op returns a TensorImpl sharing the Storage without
+    # incrementing its refcount; nothing in torch core can express that, and
+    # faking it via storage surgery risks use-after-free inside capture.)
+    return t.view_as(t)
+
+
 def _load_vendor_impl():
     """Prefer the compiled C++ op (storage-decoupled TensorImpl).
 
@@ -69,18 +81,35 @@ def _load_vendor_impl():
     fn = None
     try:
         fn = torch.ops.sgl_kernel.weak_ref_tensor
-        fn(torch.zeros(1, device="cuda"))
     except Exception:
         fn = getattr(mod, "weak_ref_tensor", None)
         if fn is None:
             return None
-        try:
-            fn(torch.zeros(1, device="cuda"))
-        except Exception:
-            return None
+
+    candidates = [fn]
+    alternate = getattr(mod, "weak_ref_tensor", None)
+    if alternate is not None and alternate is not fn:
+        candidates.append(alternate)
+    implementations = {}
 
     def _impl(t):
-        return fn(t) if isinstance(t, torch.Tensor) else t
+        if not isinstance(t, torch.Tensor):
+            return t
+        if t.numel() == 0:
+            return t
+        device = t.device
+        if device not in implementations:
+            probe = torch.zeros(1, device=device)
+            implementations[device] = None
+            for candidate in candidates:
+                try:
+                    candidate(probe)
+                except Exception:
+                    continue
+                implementations[device] = candidate
+                break
+        implementation = implementations[device]
+        return implementation(t) if implementation is not None else _fallback_weak_ref_tensor(t)
 
     return _impl
 
@@ -97,15 +126,7 @@ if _vendor_weak_ref_tensor is not None:
 else:
 
     def weak_ref_tensor(t: torch.Tensor) -> torch.Tensor:
-        if not isinstance(t, torch.Tensor):
-            raise TypeError(f"weak_ref_tensor expects a Tensor, got {type(t)!r}")
-        if t.numel() == 0:
-            return t
-        # Strong-reference stand-in: view with identical shape/stride/layout.
-        # (The upstream C++ op returns a TensorImpl sharing the Storage without
-        # incrementing its refcount; nothing in torch core can express that, and
-        # faking it via storage surgery risks use-after-free inside capture.)
-        return t.view_as(t)
+        return _fallback_weak_ref_tensor(t)
 
 
 def weak_ref_tensors(tensors):
