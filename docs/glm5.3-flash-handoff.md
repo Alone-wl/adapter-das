@@ -39,6 +39,14 @@ P 后续原参数启动通过，完整 P/D 算术请求返回 2，`finish_reason
 
 17:34 组合仍在第二轮预热报槽位不足，只有首轮有效（Mean TTFT 16595.32ms）。后续定向库存复现确认：失败的三个 rank 各有 47 个 pending HiCache 写回节点，7 个完成 ACK 覆盖 43 个节点，但全 rank 最小完成数被其他 rank 的空队列压为零，写回锁无法回收。plugin `e3d020f` 将本地写回回收限定到 GLM CP LayerSplit、attention TP=1/PP=1、write_through、cache 模式且无 L3；原 ACK synchronize/锁释放、load 和全局 ready-count/digest 同步保留。真实 8-GPU 资源反例与正式 Hook 回归通过，D2H 快照逐位一致；整服务原参数重启与 `p-f14-writeack-baseline3/` 三轮压力待完成。另一项释放新 checkpoint 锁的局部候选已回退且从未部署，不能把它作为本轮根因修复。临时异常诊断已清理，normal INT8 异步计数仍未部署。
 
+## 2026-11-07 最终 P/D 回归
+
+P 已迁回 a12r4n13，D 保持 f14r1n15/16；INT8、无 E，保留 CP、HiCache、DeepEP、EAGLE 与既有 Graph 配置。实验根目录为 `/home/work/agent/das-glm53-tx-pd`，P 与 router 启动入口分别为 `tx/run-p-a12r4n13-current.sh` 和 `tx/run-router-a12r4n13-current.sh`，A12 容器内 API 为 `127.0.0.1:30002`。长前缀三条请求完整返回 2/2/7，后两次命中 3840 tokens。F14 临时 P 和 router 已停止，容器保留。
+
+写回回收修复后，同硬件两臂各 1536 个压力请求全部成功。P 异步计数使 rank 0 的 430 次同步复制降至 0，10 steps 减少约 406ms CPU 调用时间；三轮端到端 TTFT 中位数 16.26→16.30 秒，未测得提速。F14 A/B 不与 A12 混作性能对照。
+
+A12 最终组合并行完成 AIME25 **25/30（83.33%）**、HumanEval **163/164（99.39%）**，194 个请求均完成、无请求错误。两份脚本与上一轮逐字节相同。AIME25 零基索引 9 同一乘法等式重复 2469 次后截断；12、14 达到 64000 tokens，正确答案只出现在推理中；21 为容斥计数错误，23 多计开区间的一个零点。HumanEval/116 的题面示例与文字规格及测试不一致，模型选择了只按数值排序，遗漏二进制 1 的数量。证据与原始报告见 `perfopt-20261105/accuracy-final-a12/`。总分与旧组合相同，错题不同；仍有复读，尚不能归因于算子或宣称 handoff 的精度问题已解决。
+
 ## 2026-11-05 grammar mask 启动线程兼容
 
 用户在原 P 启动入口重启后，首次 grammar mask 调用报 Triton
