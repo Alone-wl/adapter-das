@@ -1,6 +1,37 @@
-# GLM-5.3 Flash 适配交接（2026-11-04）
+# GLM-5.3 Flash 适配交接
 
-本文交接当前候选源码、启动入口、已有证据与未完成事项。它不是生产验收报告。
+## 2026-11-10 Fork 交付与复现入口
+
+| 组件 | 分支 | 交付时的提交 |
+|---|---|---|
+| [Plugin fork](https://github.com/Alone-wl/sglang-plugin-das/tree/feat/glm5.3-flash) | `feat/glm5.3-flash` | `fd789c1c42296d3726c9e916cdd3e90b79524944` |
+| [Adapter fork](https://github.com/Alone-wl/adapter-das/tree/feat/glm5.3-flash) | `feat/glm5.3-flash` | `b1a1289d435d75ade22e9f6983604fcf16efb55f` |
+| 官方 SGLang | 固定 commit | `baa9befa381511cd4d56f83980951e5a45fffc6d` |
+
+Plugin 和 Adapter 分别 fork 自 HYGON-AI 的同名仓库，交付分支已推送到 fork，PR 尚未创建。表中 Adapter 提交固定的是交付快照。
+
+```bash
+git clone --branch feat/glm5.3-flash https://github.com/Alone-wl/sglang-plugin-das.git
+git clone --branch feat/glm5.3-flash https://github.com/Alone-wl/adapter-das.git
+```
+
+复现 11 月 7 日评测时，使用下文「2026-11-07 最终 P/D 回归」记录的实验入口。P 在 a12r4n13，D 在 f14r1n15/16，使用 `plugin-dev` 容器、INT8、无 Encoder。保留 CP、HiCache、DeepEP、EAGLE 和 Graph，评测环境已去掉 `SGLANG_SCHEDULER_SKIP_ALL_GATHER`。下文的 Python 3.12 与 D INT4 启动配方属于 11 月 4 日交接快照。
+
+## 2026-11-10 AIME25 对比
+
+| 运行组合 | 正确数 | 错题（零基索引） |
+|---|---:|---|
+| Plugin P/D（11 月 7 日） | 25/30（83.33%） | 9、12、14、21、23 |
+| 侵入式 sglang-das TX-on（11 月 9 日） | 28/30（93.33%） | 13、14 |
+
+两轮各完成 30 个请求，输入消息和标准答案逐题一致。配置记录均为 temperature=1、top_p=0.95、seed=42、max_tokens=64000。TX 独有正确题为 9、12、21、23，Plugin 独有正确题为 13，两边都错的是 14。
+
+Plugin 第 9 题的同一乘法等式整行重复 2469 次，达到 64000 tokens 后截断，最终答案为空。TX 同题在 16107 tokens 正常停止并答对（81）。TX 第 13、14 题均达到 64000 tokens，最终答案为空。按连续 50 词完全重复检查，TX 这轮未见与 Plugin 第 9 题同类的长段复读。两轮运行时及部署配置未做全量对齐，单轮 10 个百分点的差距尚无法归因到 Plugin 或某个算子。
+
+原始 EvalScope 结果相对于容器 `/home/work/agent`：
+
+- Plugin：`das-glm53-tx-pd/perfopt-20261105/accuracy-final-a12/aime25/outputs/20261107_130812/`
+- TX-on：`sync-20261108/defer/fusion-aime25/results/tx-on/aime25/outputs/20261109_152612/`
 
 ## 2026-11-06 P/D 性能：冷启动 GPU 上下文候选
 
@@ -71,7 +102,7 @@ kernel 对象的 `run`，按实际设备 warp size 限制 `num_warps`；仍调�
 探针在同目录 `probe.py`。本次算子检查不等于重新完成 P/D 启动和数据集
 精度验收；服务集成另行核验。原历史源码清单保留快照语义。
 
-## 交付版本与来源
+## 2026-11-04 交付版本与来源
 
 - Plugin：HYGON-AI/sglang-plugin-das，`feat/glm5.3-flash`；本地基底 `405b8dc`。
 - Adapter：maxiaobetter/adapter-das（HYGON-AI/adapter-das 的 fork），`feat/glm5.3-flash`；本地基底 `b8af034`。
@@ -82,7 +113,7 @@ kernel 对象的 `run`，按实际设备 warp size 限制 `num_warps`；仍调�
 运行时代码及打包入口逐文件 SHA256 见 `docs/glm5.3-flash-source.json`。文档保留本地历史记录，不能把历史分数视为当前快照的成绩。
 - 远端原包含通用框架兼容和其他模型依赖，因此本分支是可追溯候选快照，不是已经缩减到最小的 GLM 专属补丁。后续按依赖关系拆分评审。
 
-## 环境与启动
+## 2026-11-04 环境与启动配方
 
 用户指定后续 plugin/adapter 暂用 Python 3.12 镜像：
 
